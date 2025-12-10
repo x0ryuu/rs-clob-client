@@ -295,6 +295,13 @@ pub struct Client<S: State = Unauthenticated> {
     inner: Arc<ClientInner<S>>,
 }
 
+impl Default for Client<Unauthenticated> {
+    fn default() -> Self {
+        Client::new("https://clob.polymarket.com", Config::default())
+            .expect("Client with default endpoint should succeed")
+    }
+}
+
 /// Configuration for [`Client`]
 #[derive(Clone, Debug, Default, Builder)]
 #[builder(pattern = "owned", build_fn(error = "Error"))]
@@ -1316,5 +1323,15 @@ impl<S: Signer> Client<Authenticated<S, Builder>> {
         let headers = self.create_headers(&request).await?;
 
         self.request(request, Some(headers)).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn client_default_should_succeed() {
+        _ = Client::default();
     }
 }
