@@ -139,13 +139,12 @@ impl Serialize for Subscription {
         map.serialize_entry("type", &self.msg_type)?;
 
         if let Some(filters) = &self.filters {
-            // Parse filters as JSON value to emit raw JSON, not escaped string
-            if let Ok(json_value) = serde_json::from_str::<Value>(filters) {
-                map.serialize_entry("filters", &json_value)?;
-            } else {
-                // Fallback: emit as string if not valid JSON
-                map.serialize_entry("filters", filters)?;
-            }
+            let filters_string = match serde_json::from_str::<serde_json::Value>(filters) {
+                Ok(v) => serde_json::to_string(&v).map_err(serde::ser::Error::custom)?,
+                Err(_) => filters.clone(),
+            };
+
+            map.serialize_entry("filters", &filters_string)?;
         }
 
         // SECURITY: Credentials are intentionally revealed here for the WebSocket auth protocol.
