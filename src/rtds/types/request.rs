@@ -139,7 +139,7 @@ impl Serialize for Subscription {
         map.serialize_entry("type", &self.msg_type)?;
 
         if let Some(filters) = &self.filters {
-            let filters_string = match serde_json::from_str::<serde_json::Value>(filters) {
+            let filters_string = match serde_json::from_str::<Value>(filters) {
                 Ok(v) => serde_json::to_string(&v).map_err(serde::ser::Error::custom)?,
                 Err(_) => filters.clone(),
             };
