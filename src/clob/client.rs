@@ -41,7 +41,10 @@ use crate::clob::types::response::{
 use crate::clob::types::{SignableOrder, SignatureType, SignedOrder, TickSize};
 use crate::error::{Error, Synchronization};
 use crate::types::Address;
-use crate::{AMOY, POLYGON, Result, Timestamp, ToQueryParams as _, auth, contract_config};
+use crate::{
+    AMOY, POLYGON, Result, Timestamp, ToQueryParams as _, auth, contract_config,
+    derive_proxy_wallet, derive_safe_wallet,
+};
 
 const ORDER_NAME: Option<Cow<'static, str>> = Some(Cow::Borrowed("Polymarket CTF Exchange"));
 const VERSION: Option<Cow<'static, str>> = Some(Cow::Borrowed("1"));
@@ -106,6 +109,10 @@ impl<S: Signer, K: Kind> AuthenticationBuilder<'_, S, K> {
 
     /// Attempt to elevate the inner `client` to [`Client<Authenticated<K>>`] using the optional
     /// fields supplied in the builder.
+    #[expect(
+        clippy::missing_panics_doc,
+        reason = "chain_id panic is guarded by prior validation"
+    )]
     pub async fn authenticate(self) -> Result<Client<Authenticated<K>>> {
         let inner = Arc::into_inner(self.client.inner).ok_or(Synchronization)?;
 
@@ -123,7 +130,37 @@ impl<S: Signer, K: Kind> AuthenticationBuilder<'_, S, K> {
             }
         }
 
-        match (self.funder, self.signature_type) {
+        // SAFETY: chain_id is validated above to be either POLYGON or AMOY
+        let chain_id = self.signer.chain_id().expect("validated above");
+
+        // Auto-derive funder from signer using CREATE2 when using proxy signature types
+        // without explicit funder. This computes the deterministic wallet address that
+        // Polymarket deploys for the user.
+        let funder = match (self.funder, self.signature_type) {
+            (None, Some(SignatureType::Proxy)) => {
+                let derived =
+                    derive_proxy_wallet(self.signer.address(), chain_id).ok_or_else(|| {
+                        Error::validation(
+                            "Proxy wallet derivation not supported on this chain. \
+                             Please provide an explicit funder address.",
+                        )
+                    })?;
+                Some(derived)
+            }
+            (None, Some(SignatureType::GnosisSafe)) => {
+                let derived =
+                    derive_safe_wallet(self.signer.address(), chain_id).ok_or_else(|| {
+                        Error::validation(
+                            "Safe wallet derivation not supported on this chain. \
+                             Please provide an explicit funder address.",
+                        )
+                    })?;
+                Some(derived)
+            }
+            (funder, _) => funder,
+        };
+
+        match (funder, self.signature_type) {
             (Some(_), Some(sig @ SignatureType::Eoa)) => {
                 return Err(Error::validation(format!(
                     "Cannot have a funder address with a {sig} signature type"
@@ -137,11 +174,7 @@ impl<S: Signer, K: Kind> AuthenticationBuilder<'_, S, K> {
                     "Cannot have a zero funder address with a {sig} signature type"
                 )));
             }
-            (None, Some(sig @ (SignatureType::Proxy | SignatureType::GnosisSafe))) => {
-                return Err(Error::validation(format!(
-                    "Must have a funder address with a {sig} signature type"
-                )));
-            }
+            // Note: (None, Some(Proxy/GnosisSafe)) is unreachable due to auto-derivation above
             _ => {}
         }
 
@@ -175,7 +208,7 @@ impl<S: Signer, K: Kind> AuthenticationBuilder<'_, S, K> {
                 tick_sizes: inner.tick_sizes,
                 neg_risk: inner.neg_risk,
                 fee_rate_bps: inner.fee_rate_bps,
-                funder: self.funder,
+                funder,
                 signature_type: self.signature_type.unwrap_or(SignatureType::Eoa),
                 salt_generator: self.salt_generator.unwrap_or(generate_seed),
             }),
@@ -196,7 +229,7 @@ impl<S: Signer, K: Kind> AuthenticationBuilder<'_, S, K> {
 /// [`Client`] is thread-safe
 ///
 /// Create an unauthenticated client:
-/// ```rust
+/// ```rust,no_run
 /// use polymarket_client_sdk::Result;
 /// use polymarket_client_sdk::clob::{Client, Config};
 ///
@@ -1448,6 +1481,206 @@ impl Client<Authenticated<Builder>> {
         let headers = self.create_headers(&request).await?;
 
         crate::request(&self.inner.client, request, Some(headers)).await
+    }
+}
+
+#[cfg(feature = "rfq")]
+impl<K: Kind> Client<Authenticated<K>> {
+    /// Creates an RFQ Request to buy or sell outcome tokens.
+    ///
+    /// This initiates the RFQ flow where market makers can provide quotes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP request fails or the response cannot be parsed.
+    pub async fn create_request(
+        &self,
+        request: &crate::clob::types::CreateRfqRequestRequest,
+    ) -> Result<crate::clob::types::CreateRfqRequestResponse> {
+        let http_request = self
+            .client()
+            .request(Method::POST, format!("{}rfq/request", self.host()))
+            .json(request)
+            .build()?;
+        let headers = self.create_headers(&http_request).await?;
+
+        crate::request(&self.inner.client, http_request, Some(headers)).await
+    }
+
+    /// Cancels an RFQ request.
+    ///
+    /// The request must be in the `STATE_ACCEPTING_QUOTES` state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP request fails or the request cannot be canceled.
+    pub async fn cancel_request(
+        &self,
+        request: &crate::clob::types::CancelRfqRequestRequest,
+    ) -> Result<()> {
+        let http_request = self
+            .client()
+            .request(Method::DELETE, format!("{}rfq/request", self.host()))
+            .json(request)
+            .build()?;
+        let headers = self.create_headers(&http_request).await?;
+
+        self.rfq_request_text(http_request, headers).await
+    }
+
+    /// Gets RFQ requests.
+    ///
+    /// Requesters can only view their own requests.
+    /// Quoters can only see their own quotes and requests that they quoted.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP request fails or the response cannot be parsed.
+    pub async fn requests(
+        &self,
+        request: &crate::clob::types::RfqRequestsRequest,
+        next_cursor: Option<&str>,
+    ) -> Result<crate::clob::types::response::Page<crate::clob::types::RfqRequest>> {
+        let params = request.query_params(next_cursor);
+        let http_request = self
+            .client()
+            .request(Method::GET, format!("{}rfq/request{params}", self.host()))
+            .build()?;
+        let headers = self.create_headers(&http_request).await?;
+
+        crate::request(&self.inner.client, http_request, Some(headers)).await
+    }
+
+    /// Creates an RFQ Quote in response to a Request.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP request fails or the response cannot be parsed.
+    pub async fn create_quote(
+        &self,
+        request: &crate::clob::types::CreateRfqQuoteRequest,
+    ) -> Result<crate::clob::types::CreateRfqQuoteResponse> {
+        let http_request = self
+            .client()
+            .request(Method::POST, format!("{}rfq/quote", self.host()))
+            .json(request)
+            .build()?;
+        let headers = self.create_headers(&http_request).await?;
+
+        crate::request(&self.inner.client, http_request, Some(headers)).await
+    }
+
+    /// Cancels an RFQ quote.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP request fails or the quote cannot be canceled.
+    pub async fn cancel_quote(
+        &self,
+        request: &crate::clob::types::CancelRfqQuoteRequest,
+    ) -> Result<()> {
+        let http_request = self
+            .client()
+            .request(Method::DELETE, format!("{}rfq/quote", self.host()))
+            .json(request)
+            .build()?;
+        let headers = self.create_headers(&http_request).await?;
+
+        self.rfq_request_text(http_request, headers).await
+    }
+
+    /// Gets RFQ quotes.
+    ///
+    /// Requesters can view quotes for their requests.
+    /// Quoters can view all quotes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP request fails or the response cannot be parsed.
+    pub async fn quotes(
+        &self,
+        request: &crate::clob::types::RfqQuotesRequest,
+        next_cursor: Option<&str>,
+    ) -> Result<crate::clob::types::response::Page<crate::clob::types::RfqQuote>> {
+        let params = request.query_params(next_cursor);
+        let http_request = self
+            .client()
+            .request(Method::GET, format!("{}rfq/quote{params}", self.host()))
+            .build()?;
+        let headers = self.create_headers(&http_request).await?;
+
+        crate::request(&self.inner.client, http_request, Some(headers)).await
+    }
+
+    /// Requester accepts an RFQ Quote.
+    ///
+    /// This creates an Order that the Requester must sign. The signed order
+    /// is submitted to the API to initiate the trade.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP request fails or the quote cannot be accepted.
+    pub async fn accept_quote(
+        &self,
+        request: &crate::clob::types::AcceptRfqQuoteRequest,
+    ) -> Result<crate::clob::types::AcceptRfqQuoteResponse> {
+        let http_request = self
+            .client()
+            .request(Method::POST, format!("{}rfq/request/accept", self.host()))
+            .json(request)
+            .build()?;
+        let headers = self.create_headers(&http_request).await?;
+
+        self.rfq_request_text(http_request, headers).await?;
+        Ok(crate::clob::types::AcceptRfqQuoteResponse)
+    }
+
+    /// Quoter approves an RFQ order during the last look window.
+    ///
+    /// This queues the order for onchain execution.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP request fails or the order cannot be approved.
+    pub async fn approve_order(
+        &self,
+        request: &crate::clob::types::ApproveRfqOrderRequest,
+    ) -> Result<crate::clob::types::ApproveRfqOrderResponse> {
+        let http_request = self
+            .client()
+            .request(Method::POST, format!("{}rfq/quote/approve", self.host()))
+            .json(request)
+            .build()?;
+        let headers = self.create_headers(&http_request).await?;
+
+        crate::request(&self.inner.client, http_request, Some(headers)).await
+    }
+
+    /// Helper method for RFQ endpoints that return plain text instead of JSON.
+    ///
+    /// This is used for cancel operations (`cancel_request`, `cancel_quote`)
+    /// and accept quote which return "OK" as plain text rather than a JSON response.
+    /// The standard `crate::request` helper expects JSON responses and would fail
+    /// to deserialize plain text.
+    async fn rfq_request_text(
+        &self,
+        mut request: reqwest::Request,
+        headers: reqwest::header::HeaderMap,
+    ) -> Result<()> {
+        let method = request.method().clone();
+        let path = request.url().path().to_owned();
+
+        *request.headers_mut() = headers;
+
+        let response = self.inner.client.execute(request).await?;
+        let status = response.status();
+
+        if !status.is_success() {
+            let message = response.text().await.unwrap_or_default();
+            return Err(crate::error::Error::status(status, method, path, message));
+        }
+
+        Ok(())
     }
 }
 
