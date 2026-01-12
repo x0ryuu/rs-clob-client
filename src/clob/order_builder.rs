@@ -1,5 +1,4 @@
 use std::marker::PhantomData;
-use std::str::FromStr as _;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use alloy::primitives::U256;
@@ -40,7 +39,7 @@ pub struct OrderBuilder<OrderKind, K: AuthKind> {
     pub(crate) signer: Address,
     pub(crate) signature_type: SignatureType,
     pub(crate) salt_generator: fn() -> u64,
-    pub(crate) token_id: Option<String>,
+    pub(crate) token_id: Option<U256>,
     pub(crate) price: Option<Decimal>,
     pub(crate) size: Option<Decimal>,
     pub(crate) amount: Option<Amount>,
@@ -49,6 +48,7 @@ pub struct OrderBuilder<OrderKind, K: AuthKind> {
     pub(crate) expiration: Option<DateTime<Utc>>,
     pub(crate) taker: Option<Address>,
     pub(crate) order_type: Option<OrderType>,
+    pub(crate) post_only: Option<bool>,
     pub(crate) funder: Option<Address>,
     pub(crate) _kind: PhantomData<OrderKind>,
 }
@@ -56,8 +56,8 @@ pub struct OrderBuilder<OrderKind, K: AuthKind> {
 impl<OrderKind, K: AuthKind> OrderBuilder<OrderKind, K> {
     /// Sets the `token_id` for this builder. This is a required field.
     #[must_use]
-    pub fn token_id<ID: Into<String>>(mut self, token_id: ID) -> Self {
-        self.token_id = Some(token_id.into());
+    pub fn token_id(mut self, token_id: U256) -> Self {
+        self.token_id = Some(token_id);
         self
     }
 
@@ -68,7 +68,7 @@ impl<OrderKind, K: AuthKind> OrderBuilder<OrderKind, K> {
         self
     }
 
-    /// Sets the [`Side`] for this builder.
+    /// Sets the nonce for this builder.
     #[must_use]
     pub fn nonce(mut self, nonce: u64) -> Self {
         self.nonce = Some(nonce);
@@ -90,6 +90,13 @@ impl<OrderKind, K: AuthKind> OrderBuilder<OrderKind, K> {
     #[must_use]
     pub fn order_type(mut self, order_type: OrderType) -> Self {
         self.order_type = Some(order_type);
+        self
+    }
+
+    /// Sets the `postOnly` flag for this builder.
+    #[must_use]
+    pub fn post_only(mut self, post_only: bool) -> Self {
+        self.post_only = Some(post_only);
         self
     }
 }
@@ -115,7 +122,7 @@ impl<K: AuthKind> OrderBuilder<Limit, K> {
         tracing::instrument(skip(self), err(level = "warn"))
     )]
     pub async fn build(self) -> Result<SignableOrder> {
-        let Some(token_id) = self.token_id.clone() else {
+        let Some(token_id) = self.token_id else {
             return Err(Error::validation(
                 "Unable to build Order due to missing token ID",
             ));
@@ -139,10 +146,10 @@ impl<K: AuthKind> OrderBuilder<Limit, K> {
             )));
         }
 
-        let fee_rate = self.client.fee_rate_bps(&token_id).await?;
+        let fee_rate = self.client.fee_rate_bps(token_id).await?;
         let minimum_tick_size = self
             .client
-            .tick_size(&token_id)
+            .tick_size(token_id)
             .await?
             .minimum_tick_size
             .as_decimal();
@@ -187,10 +194,17 @@ impl<K: AuthKind> OrderBuilder<Limit, K> {
         let expiration = self.expiration.unwrap_or(DateTime::<Utc>::UNIX_EPOCH);
         let taker = self.taker.unwrap_or(Address::ZERO);
         let order_type = self.order_type.unwrap_or(OrderType::GTC);
+        let post_only = Some(self.post_only.unwrap_or(false));
 
         if !matches!(order_type, OrderType::GTD) && expiration > DateTime::<Utc>::UNIX_EPOCH {
             return Err(Error::validation(
                 "Only GTD orders may have a non-zero expiration",
+            ));
+        }
+
+        if post_only == Some(true) && !matches!(order_type, OrderType::GTC | OrderType::GTD) {
+            return Err(Error::validation(
+                "postOnly is only supported for GTC and GTD orders",
             ));
         }
 
@@ -221,7 +235,7 @@ impl<K: AuthKind> OrderBuilder<Limit, K> {
             salt: U256::from(salt),
             maker: self.funder.unwrap_or(self.signer),
             taker,
-            tokenId: U256::from_str(&token_id)?,
+            tokenId: token_id,
             makerAmount: U256::from(to_fixed_u128(maker_amount)),
             takerAmount: U256::from(to_fixed_u128(taker_amount)),
             side: side as u8,
@@ -237,7 +251,11 @@ impl<K: AuthKind> OrderBuilder<Limit, K> {
         #[cfg(feature = "tracing")]
         tracing::debug!(token_id = %token_id, side = ?side, price = %price, size = %size, "limit order built");
 
-        Ok(SignableOrder { order, order_type })
+        Ok(SignableOrder {
+            order,
+            order_type,
+            post_only,
+        })
     }
 }
 
@@ -264,7 +282,6 @@ impl<K: AuthKind> OrderBuilder<Market, K> {
     async fn calculate_price(&self, order_type: OrderType) -> Result<Decimal> {
         let token_id = self
             .token_id
-            .as_ref()
             .expect("Token ID was already validated in `build`");
         let side = self.side.expect("Side was already validated in `build`");
         let amount = self
@@ -275,7 +292,7 @@ impl<K: AuthKind> OrderBuilder<Market, K> {
         let book = self
             .client
             .order_book(&OrderBookSummaryRequest {
-                token_id: token_id.to_owned(),
+                token_id,
                 side: None,
             })
             .await?;
@@ -329,7 +346,7 @@ impl<K: AuthKind> OrderBuilder<Market, K> {
         tracing::instrument(skip(self), err(level = "warn"))
     )]
     pub async fn build(self) -> Result<SignableOrder> {
-        let Some(token_id) = self.token_id.clone() else {
+        let Some(token_id) = self.token_id else {
             return Err(Error::validation(
                 "Unable to build Order due to missing token ID",
             ));
@@ -348,19 +365,25 @@ impl<K: AuthKind> OrderBuilder<Market, K> {
         let nonce = self.nonce.unwrap_or(0);
         let taker = self.taker.unwrap_or(Address::ZERO);
 
-        let order_type = self.order_type.unwrap_or(OrderType::FAK);
+        let order_type = self.order_type.clone().unwrap_or(OrderType::FAK);
+        let post_only = self.post_only;
+        if post_only == Some(true) {
+            return Err(Error::validation(
+                "postOnly is only supported for limit orders",
+            ));
+        }
         let price = match self.price {
             Some(price) => price,
-            None => self.calculate_price(order_type).await?,
+            None => self.calculate_price(order_type.clone()).await?,
         };
 
         let minimum_tick_size = self
             .client
-            .tick_size(&token_id)
+            .tick_size(token_id)
             .await?
             .minimum_tick_size
             .as_decimal();
-        let fee_rate = self.client.fee_rate_bps(&token_id).await?;
+        let fee_rate = self.client.fee_rate_bps(token_id).await?;
 
         let decimals = minimum_tick_size.scale();
 
@@ -424,7 +447,7 @@ impl<K: AuthKind> OrderBuilder<Market, K> {
             salt: U256::from(salt),
             maker: self.funder.unwrap_or(self.signer),
             taker,
-            tokenId: U256::from_str(&token_id)?,
+            tokenId: token_id,
             makerAmount: U256::from(to_fixed_u128(maker_amount)),
             takerAmount: U256::from(to_fixed_u128(taker_amount)),
             side: side as u8,
@@ -438,7 +461,11 @@ impl<K: AuthKind> OrderBuilder<Market, K> {
         #[cfg(feature = "tracing")]
         tracing::debug!(token_id = %token_id, side = ?side, price = %price, amount = %amount.as_inner(), "market order built");
 
-        Ok(SignableOrder { order, order_type })
+        Ok(SignableOrder {
+            order,
+            order_type,
+            post_only: None,
+        })
     }
 }
 

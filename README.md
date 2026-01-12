@@ -66,15 +66,18 @@ cargo run --example unauthenticated
 
 The crate is modular with optional features for different Polymarket APIs:
 
-| Feature | Description |
-|---------|-------------|
-| *(default)* | Core CLOB client for order placement, market data, and authentication |
-| `tracing` | Structured logging via [`tracing`](https://docs.rs/tracing) for HTTP requests, auth flows, and caching |
-| `ws` | WebSocket client for real-time orderbook, price, and user event streaming |
-| `rtds` | Real-time data streams for crypto prices (Binance, Chainlink) and comments |
-| `data` | Data API client for positions, trades, leaderboards, and analytics |
-| `gamma` | Gamma API client for market/event discovery, search, and metadata |
-| `bridge` | Bridge API client for cross-chain deposits (EVM, Solana, Bitcoin) |
+| Feature      | Description                                                                                                                                    |
+|--------------|------------------------------------------------------------------------------------------------------------------------------------------------|
+| `clob`       | Core CLOB client for order placement, market data, and authentication                                                                          |
+| `tracing`    | Structured logging via [`tracing`](https://docs.rs/tracing) for HTTP requests, auth flows, and caching                                         |
+| `ws`         | WebSocket client for real-time orderbook, price, and user event streaming                                                                      |
+| `rtds`       | Real-time data streams for crypto prices (Binance, Chainlink) and comments                                                                     |
+| `data`       | Data API client for positions, trades, leaderboards, and analytics                                                                             |
+| `gamma`      | Gamma API client for market/event discovery, search, and metadata                                                                              |
+| `bridge`     | Bridge API client for cross-chain deposits (EVM, Solana, Bitcoin)                                                                              |
+| `rfq`        | RFQ API (within CLOB) for submitting and querying quotes                                                                                       |
+| `heartbeats` | Clob feature that automatically sends heartbeat messages to the Polymarket server, if the client disconnects all open orders will be cancelled |
+| `ctf`        | CTF API client to perform split/merge/redeem on binary and neg risk markets
 
 Enable features in your `Cargo.toml`:
 
@@ -125,7 +128,7 @@ See `examples/` for the complete set. Below are hand-picked examples for common 
 ### CLOB Client
 
 #### Unauthenticated client (read-only)
-```rust,no_run
+```rust,ignore
 use polymarket_client_sdk::clob::Client;
 
 #[tokio::main]
@@ -146,7 +149,7 @@ Set `POLYMARKET_PRIVATE_KEY` as an environment variable with your private key.
 ##### [EOA](https://www.binance.com/en/academy/glossary/externally-owned-account-eoa) wallets
 If using MetaMask or hardware wallet, you must first set token allowances. See [Token Allowances](#token-allowances) section below.
 
-```rust,no_run
+```rust,ignore
 use std::str::FromStr as _;
 
 use alloy::signers::Signer as _;
@@ -227,7 +230,7 @@ See [SignatureType](src/clob/types/mod.rs#L182) for more information.
 
 ##### Place a market order
 
-```rust,no_run
+```rust,ignore
 use std::str::FromStr as _;
 
 use alloy::signers::Signer as _;
@@ -264,7 +267,7 @@ async fn main() -> anyhow::Result<()> {
 
 ##### Place a limit order
 
-```rust,no_run
+```rust,ignore
 use std::str::FromStr as _;
 
 use alloy::signers::Signer as _;
@@ -303,7 +306,7 @@ async fn main() -> anyhow::Result<()> {
 #### Builder-authenticated client
 
 For institutional/third-party app integrations with remote signing:
-```rust,no_run
+```rust,ignore
 use std::str::FromStr as _;
 
 use alloy::signers::Signer as _;
@@ -326,7 +329,7 @@ async fn main() -> anyhow::Result<()> {
         .authenticate()
         .await?;
 
-    let client = client.promote_to_builder(builder_config)?;
+    let client = client.promote_to_builder(builder_config).await?;
 
     let ok = client.ok().await?;
     println!("Ok: {ok}");
@@ -428,7 +431,7 @@ async fn main() -> anyhow::Result<()> {
 }
 ```
 
-See [`examples/gamma.rs`](examples/gamma.rs) for tags, series, comments, and sports endpoints.
+See [`examples/gamma.rs`](examples/gamma/client.rs) for tags, series, comments, and sports endpoints.
 
 #### Bridge API
 Cross-chain deposits from EVM chains, Solana, and Bitcoin. Requires the `bridge` feature.

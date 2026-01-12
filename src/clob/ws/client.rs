@@ -9,14 +9,14 @@ use once_cell::sync::OnceCell;
 use super::interest::InterestTracker;
 use super::subscription::{ChannelType, SubscriptionManager};
 use super::types::response::{
-    BestBidAsk, BookUpdate, MarketResolved, MidpointUpdate, NewMarket, OrderMessage, PriceChange,
-    TradeMessage, WsMessage,
+    BestBidAsk, BookUpdate, LastTradePrice, MarketResolved, MidpointUpdate, NewMarket,
+    OrderMessage, PriceChange, TradeMessage, WsMessage,
 };
 use crate::Result;
 use crate::auth::state::{Authenticated, State, Unauthenticated};
 use crate::auth::{Credentials, Kind as AuthKind, Normal};
 use crate::error::Error;
-use crate::types::{Address, Decimal};
+use crate::types::{Address, B256, Decimal, U256};
 use crate::ws::ConnectionManager;
 use crate::ws::config::Config;
 use crate::ws::connection::ConnectionState;
@@ -30,7 +30,10 @@ use crate::ws::connection::ConnectionState;
 /// # Examples
 ///
 /// ```rust, no_run
+/// use std::str::FromStr as _;
+///
 /// use polymarket_client_sdk::clob::ws::Client;
+/// use polymarket_client_sdk::types::U256;
 /// use futures::StreamExt;
 ///
 /// #[tokio::main]
@@ -38,7 +41,7 @@ use crate::ws::connection::ConnectionState;
 ///     // Create unauthenticated client
 ///     let client = Client::default();
 ///
-///     let stream = client.subscribe_orderbook(vec!["asset_id".to_owned()])?;
+///     let stream = client.subscribe_orderbook(vec![U256::from_str("106585164761922456203746651621390029417453862034640469075081961934906147433548")?])?;
 ///     let mut stream = Box::pin(stream);
 ///
 ///     while let Some(book) = stream.next().await {
@@ -149,10 +152,23 @@ impl Client<Unauthenticated> {
 
 // Methods available in any state
 impl<S: State> Client<S> {
-    /// Subscribe to orderbook updates for specific assets.
+    /// Subscribes to real-time orderbook updates for specified market assets.
+    ///
+    /// Returns a stream of orderbook snapshots showing all bid and ask levels.
+    /// Each update contains the full orderbook state at that moment, useful for
+    /// maintaining an accurate local orderbook copy.
+    ///
+    /// # Arguments
+    ///
+    /// * `asset_ids` - List of asset/token IDs to monitor
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the subscription cannot be created or the WebSocket
+    /// connection is not established.
     pub fn subscribe_orderbook(
         &self,
-        asset_ids: Vec<String>,
+        asset_ids: Vec<U256>,
     ) -> Result<impl Stream<Item = Result<BookUpdate>>> {
         let resources = self.market_resources()?;
         let stream = resources.subscriptions.subscribe_market(asset_ids)?;
@@ -166,10 +182,52 @@ impl<S: State> Client<S> {
         }))
     }
 
-    /// Subscribe to price changes for specific assets.
+    /// Subscribes to real-time last trade price updates for specified assets.
+    ///
+    /// Returns a stream of the most recent executed trade price for each asset.
+    /// This reflects the latest market consensus price from actual transactions.
+    ///
+    /// # Arguments
+    ///
+    /// * `asset_ids` - List of asset/token IDs to monitor
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the subscription cannot be created or the WebSocket
+    /// connection is not established.
+    pub fn subscribe_last_trade_price(
+        &self,
+        asset_ids: Vec<U256>,
+    ) -> Result<impl Stream<Item = Result<LastTradePrice>>> {
+        let resources = self.market_resources()?;
+        let stream = resources.subscriptions.subscribe_market(asset_ids)?;
+
+        Ok(stream.filter_map(|msg_result| async move {
+            match msg_result {
+                Ok(WsMessage::LastTradePrice(last_trade_price)) => Some(Ok(last_trade_price)),
+                Err(e) => Some(Err(e)),
+                _ => None,
+            }
+        }))
+    }
+
+    /// Subscribes to real-time price changes for specified assets.
+    ///
+    /// Returns a stream of price updates when the best bid or ask changes.
+    /// More lightweight than full orderbook subscriptions when you only need
+    /// top-of-book prices.
+    ///
+    /// # Arguments
+    ///
+    /// * `asset_ids` - List of asset/token IDs to monitor
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the subscription cannot be created or the WebSocket
+    /// connection is not established.
     pub fn subscribe_prices(
         &self,
-        asset_ids: Vec<String>,
+        asset_ids: Vec<U256>,
     ) -> Result<impl Stream<Item = Result<PriceChange>>> {
         let resources = self.market_resources()?;
         let stream = resources.subscriptions.subscribe_market(asset_ids)?;
@@ -183,10 +241,23 @@ impl<S: State> Client<S> {
         }))
     }
 
-    /// Subscribe to midpoint updates (calculated from best bid/ask).
+    /// Subscribes to real-time midpoint price updates for specified assets.
+    ///
+    /// Returns a stream of midpoint prices calculated as the average of the best
+    /// bid and best ask: `(best_bid + best_ask) / 2`. This provides a fair market
+    /// price estimate that updates with every orderbook change.
+    ///
+    /// # Arguments
+    ///
+    /// * `asset_ids` - List of asset/token IDs to monitor
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the subscription cannot be created or the WebSocket
+    /// connection is not established.
     pub fn subscribe_midpoints(
         &self,
-        asset_ids: Vec<String>,
+        asset_ids: Vec<U256>,
     ) -> Result<impl Stream<Item = Result<MidpointUpdate>>> {
         let stream = self.subscribe_orderbook(asset_ids)?;
 
@@ -213,7 +284,7 @@ impl<S: State> Client<S> {
     /// Requires `custom_feature_enabled` flag on the server side.
     pub fn subscribe_best_bid_ask(
         &self,
-        asset_ids: Vec<String>,
+        asset_ids: Vec<U256>,
     ) -> Result<impl Stream<Item = Result<BestBidAsk>>> {
         let stream = self
             .market_resources()?
@@ -234,7 +305,7 @@ impl<S: State> Client<S> {
     /// Requires `custom_feature_enabled` flag on the server side.
     pub fn subscribe_new_markets(
         &self,
-        asset_ids: Vec<String>,
+        asset_ids: Vec<U256>,
     ) -> Result<impl Stream<Item = Result<NewMarket>>> {
         let stream = self
             .market_resources()?
@@ -255,7 +326,7 @@ impl<S: State> Client<S> {
     /// Requires `custom_feature_enabled` flag on the server side.
     pub fn subscribe_market_resolutions(
         &self,
-        asset_ids: Vec<String>,
+        asset_ids: Vec<U256>,
     ) -> Result<impl Stream<Item = Result<MarketResolved>>> {
         let stream = self
             .market_resources()?
@@ -308,7 +379,7 @@ impl<S: State> Client<S> {
     ///
     /// This decrements the reference count for each asset. The server unsubscribe
     /// is only sent when no other subscriptions are using those assets.
-    pub fn unsubscribe_orderbook(&self, asset_ids: &[String]) -> Result<()> {
+    pub fn unsubscribe_orderbook(&self, asset_ids: &[U256]) -> Result<()> {
         self.market_resources()?
             .subscriptions
             .unsubscribe_market(asset_ids)
@@ -318,7 +389,7 @@ impl<S: State> Client<S> {
     ///
     /// This decrements the reference count for each asset. The server unsubscribe
     /// is only sent when no other subscriptions are using those assets.
-    pub fn unsubscribe_prices(&self, asset_ids: &[String]) -> Result<()> {
+    pub fn unsubscribe_prices(&self, asset_ids: &[U256]) -> Result<()> {
         self.market_resources()?
             .subscriptions
             .unsubscribe_market(asset_ids)
@@ -328,7 +399,7 @@ impl<S: State> Client<S> {
     ///
     /// This decrements the reference count for each asset. The server unsubscribe
     /// is only sent when no other subscriptions are using those assets.
-    pub fn unsubscribe_midpoints(&self, asset_ids: &[String]) -> Result<()> {
+    pub fn unsubscribe_midpoints(&self, asset_ids: &[U256]) -> Result<()> {
         self.market_resources()?
             .subscriptions
             .unsubscribe_market(asset_ids)
@@ -344,10 +415,27 @@ impl<S: State> Client<S> {
 
 // Methods only available for authenticated clients
 impl<K: AuthKind> Client<Authenticated<K>> {
-    /// Subscribe to raw user channel events (orders and trades).
+    /// Subscribes to all user-specific events (orders and trades) for specified markets.
+    ///
+    /// Returns a stream of raw WebSocket messages containing both order updates
+    /// (fills, cancellations, placements) and trade executions. Use this for
+    /// comprehensive monitoring of all trading activity.
+    ///
+    /// # Arguments
+    ///
+    /// * `markets` - List of market condition IDs to monitor
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the subscription cannot be created, the WebSocket
+    /// connection is not established, or authentication fails.
+    ///
+    /// # Note
+    ///
+    /// This method is only available on authenticated clients.
     pub fn subscribe_user_events(
         &self,
-        markets: Vec<String>,
+        markets: Vec<B256>,
     ) -> Result<impl Stream<Item = Result<WsMessage>>> {
         let resources = self.user_resources()?;
 
@@ -356,10 +444,26 @@ impl<K: AuthKind> Client<Authenticated<K>> {
             .subscribe_user(markets, &self.inner.state.credentials)
     }
 
-    /// Subscribe to user's order updates.
+    /// Subscribes to real-time order status updates for the authenticated user.
+    ///
+    /// Returns a stream of order events including order placement, fills, partial fills,
+    /// and cancellations. Useful for tracking the lifecycle of your orders in real-time.
+    ///
+    /// # Arguments
+    ///
+    /// * `markets` - List of market condition IDs to monitor
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the subscription cannot be created, the WebSocket
+    /// connection is not established, or authentication fails.
+    ///
+    /// # Note
+    ///
+    /// This method is only available on authenticated clients.
     pub fn subscribe_orders(
         &self,
-        markets: Vec<String>,
+        markets: Vec<B256>,
     ) -> Result<impl Stream<Item = Result<OrderMessage>>> {
         let stream = self.subscribe_user_events(markets)?;
 
@@ -372,10 +476,27 @@ impl<K: AuthKind> Client<Authenticated<K>> {
         }))
     }
 
-    /// Subscribe to user's trade executions.
+    /// Subscribes to real-time trade execution updates for the authenticated user.
+    ///
+    /// Returns a stream of trade events when your orders are matched and executed.
+    /// Each trade event contains details about the execution price, size, maker/taker
+    /// side, and associated order IDs.
+    ///
+    /// # Arguments
+    ///
+    /// * `markets` - List of market condition IDs to monitor
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the subscription cannot be created, the WebSocket
+    /// connection is not established, or authentication fails.
+    ///
+    /// # Note
+    ///
+    /// This method is only available on authenticated clients.
     pub fn subscribe_trades(
         &self,
-        markets: Vec<String>,
+        markets: Vec<B256>,
     ) -> Result<impl Stream<Item = Result<TradeMessage>>> {
         let stream = self.subscribe_user_events(markets)?;
 
@@ -392,7 +513,7 @@ impl<K: AuthKind> Client<Authenticated<K>> {
     ///
     /// This decrements the reference count for each market. The server unsubscribe
     /// is only sent when no other subscriptions are using those markets.
-    pub fn unsubscribe_user_events(&self, markets: &[String]) -> Result<()> {
+    pub fn unsubscribe_user_events(&self, markets: &[B256]) -> Result<()> {
         self.user_resources()?
             .subscriptions
             .unsubscribe_user(markets)
@@ -412,7 +533,7 @@ impl<K: AuthKind> Client<Authenticated<K>> {
     ///
     /// This decrements the reference count for each market. The server unsubscribe
     /// is only sent when no other subscriptions are using those markets.
-    pub fn unsubscribe_orders(&self, markets: &[String]) -> Result<()> {
+    pub fn unsubscribe_orders(&self, markets: &[B256]) -> Result<()> {
         self.unsubscribe_user_events(markets)
     }
 
@@ -420,7 +541,7 @@ impl<K: AuthKind> Client<Authenticated<K>> {
     ///
     /// This decrements the reference count for each market. The server unsubscribe
     /// is only sent when no other subscriptions are using those markets.
-    pub fn unsubscribe_trades(&self, markets: &[String]) -> Result<()> {
+    pub fn unsubscribe_trades(&self, markets: &[B256]) -> Result<()> {
         self.unsubscribe_user_events(markets)
     }
 

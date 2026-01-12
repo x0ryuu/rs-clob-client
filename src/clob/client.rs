@@ -2,6 +2,8 @@ use std::borrow::Cow;
 use std::marker::PhantomData;
 use std::mem;
 use std::sync::Arc;
+#[cfg(feature = "heartbeats")]
+use std::time::Duration;
 
 use alloy::dyn_abi::Eip712Domain;
 use alloy::primitives::U256;
@@ -15,7 +17,12 @@ use futures::Stream;
 use reqwest::header::{HeaderMap, HeaderValue};
 use reqwest::{Client as ReqwestClient, Method, Request};
 use serde_json::json;
+#[cfg(all(feature = "tracing", feature = "heartbeats"))]
+use tracing::{debug, error};
 use url::Url;
+use uuid::Uuid;
+#[cfg(feature = "heartbeats")]
+use {tokio::sync::oneshot::Receiver, tokio::time, tokio_util::sync::CancellationToken};
 
 use crate::auth::builder::{Builder, Config as BuilderConfig};
 use crate::auth::state::{Authenticated, State, Unauthenticated};
@@ -30,13 +37,20 @@ use crate::clob::types::request::{
 use crate::clob::types::response::{
     ApiKeysResponse, BalanceAllowanceResponse, BanStatusResponse, BuilderApiKeyResponse,
     BuilderTradeResponse, CancelOrdersResponse, CurrentRewardResponse, FeeRateResponse,
-    GeoblockResponse, LastTradePriceResponse, LastTradesPricesResponse, MarketResponse,
-    MarketRewardResponse, MidpointResponse, MidpointsResponse, NegRiskResponse,
+    GeoblockResponse, HeartbeatResponse, LastTradePriceResponse, LastTradesPricesResponse,
+    MarketResponse, MarketRewardResponse, MidpointResponse, MidpointsResponse, NegRiskResponse,
     NotificationResponse, OpenOrderResponse, OrderBookSummaryResponse, OrderScoringResponse,
     OrdersScoringResponse, Page, PostOrderResponse, PriceHistoryResponse, PriceResponse,
     PricesResponse, RewardsPercentagesResponse, SimplifiedMarketResponse, SpreadResponse,
     SpreadsResponse, TickSizeResponse, TotalUserEarningResponse, TradeResponse,
     UserEarningResponse, UserRewardsEarningResponse,
+};
+#[cfg(feature = "rfq")]
+use crate::clob::types::{
+    AcceptRfqQuoteRequest, AcceptRfqQuoteResponse, ApproveRfqOrderRequest, ApproveRfqOrderResponse,
+    CancelRfqQuoteRequest, CancelRfqRequestRequest, CreateRfqQuoteRequest, CreateRfqQuoteResponse,
+    CreateRfqRequestRequest, CreateRfqRequestResponse, RfqQuote, RfqQuotesRequest, RfqRequest,
+    RfqRequestsRequest,
 };
 use crate::clob::types::{SignableOrder, SignatureType, SignedOrder, TickSize};
 use crate::error::{Error, Synchronization};
@@ -198,7 +212,14 @@ impl<S: Signer, K: Kind> AuthenticationBuilder<'_, S, K> {
             kind: self.kind,
         };
 
-        Ok(Client {
+        #[cfg_attr(
+            not(feature = "heartbeats"),
+            expect(
+                unused_mut,
+                reason = "Modifier only needed when heartbeats feature is enabled"
+            )
+        )]
+        let mut client = Client {
             inner: Arc::new(ClientInner {
                 state,
                 config: inner.config,
@@ -212,14 +233,21 @@ impl<S: Signer, K: Kind> AuthenticationBuilder<'_, S, K> {
                 signature_type: self.signature_type.unwrap_or(SignatureType::Eoa),
                 salt_generator: self.salt_generator.unwrap_or(generate_seed),
             }),
-        })
+            #[cfg(feature = "heartbeats")]
+            heartbeat_token: DroppingCancellationToken(None),
+        };
+
+        #[cfg(feature = "heartbeats")]
+        Client::<Authenticated<K>>::start_heartbeats(&mut client)?;
+
+        Ok(client)
     }
 }
 
 /// The main way for API users to interact with the Polymarket CLOB.
 ///
 /// A [`Client`] can either be [`Unauthenticated`] or [`Authenticated`], that is, authenticated
-/// with a particular [`Signer`], `S`, and a particular [`AuthKind`], `K`. That [`AuthKind`] lets
+/// with a particular [`Signer`], `S`, and a particular [`Kind`], `K`. That [`Kind`] lets
 /// the client know if it's authenticating [`Normal`]ly or as a [`auth::builder::Builder`].
 ///
 /// Only the allowed methods will be available for use when in a particular state, i.e. only
@@ -274,6 +302,59 @@ impl<S: Signer, K: Kind> AuthenticationBuilder<'_, S, K> {
 #[derive(Clone, Debug)]
 pub struct Client<S: State = Unauthenticated> {
     inner: Arc<ClientInner<S>>,
+    #[cfg(feature = "heartbeats")]
+    /// When the `heartbeats` feature is enabled, the authenticated [`Client`] will automatically
+    /// send heartbeats at the default cadence. See [`Config`] for more details.
+    heartbeat_token: DroppingCancellationToken,
+}
+
+#[cfg(feature = "heartbeats")]
+/// A specific wrapper type to invoke the inner [`CancellationToken`] (if it's present) to:
+///  1. Avoid manually implementing [`Drop`] for [`Client`] which causes issues with moving values
+///     out of such a type <https://doc.rust-lang.org/error_codes/E0509.html>
+///  2. Replace the (currently non-existent) ability of specialized implementations of [`Drop`]
+///     <https://github.com/rust-lang/rust/issues/46893>
+///
+/// This way, the inner token is expressly cancelled when [`DroppingCancellationToken`] is dropped.
+/// We also have a [`Receiver<()>`] to notify when the inner [`Client`] has been dropped so that
+/// we can avoid a race condition when calling [`Arc::into_inner`] on promotion and demotion methods.
+#[derive(Clone, Debug, Default)]
+struct DroppingCancellationToken(Option<(CancellationToken, Arc<Receiver<()>>)>);
+
+#[cfg(feature = "heartbeats")]
+impl DroppingCancellationToken {
+    /// Cancel the inner [`CancellationToken`] and wait to be notified of the relevant cleanup via
+    /// [`Receiver`]. This is primarily used by the authentication methods when promoting [`Client`]s
+    /// to ensure that we do not error when transferring ownership of [`ClientInner`].
+    pub(crate) async fn cancel_and_wait(&mut self) -> Result<()> {
+        if let Some((token, rx)) = self.0.take() {
+            return match Arc::try_unwrap(rx) {
+                // If this is the only reference, cancel the token and wait for the resources to be
+                // cleaned up.
+                Ok(inner) => {
+                    token.cancel();
+                    _ = inner.await;
+                    Ok(())
+                }
+                // If not, _save_ the original token and receiver to re-use later if desired
+                Err(original) => {
+                    *self = DroppingCancellationToken(Some((token, original)));
+                    Err(Synchronization.into())
+                }
+            };
+        }
+
+        Ok(())
+    }
+}
+
+#[cfg(feature = "heartbeats")]
+impl Drop for DroppingCancellationToken {
+    fn drop(&mut self) {
+        if let Some((token, _)) = self.0.take() {
+            token.cancel();
+        }
+    }
 }
 
 impl Default for Client<Unauthenticated> {
@@ -294,6 +375,10 @@ pub struct Config {
     /// This is primarily useful for testing.
     #[builder(into)]
     geoblock_host: Option<String>,
+    #[cfg(feature = "heartbeats")]
+    #[builder(default = Duration::from_secs(5))]
+    /// How often the [`Client`] will automatically submit heartbeats. The default is five (5) seconds.
+    heartbeat_interval: Duration,
 }
 
 /// The default geoblock API host (separate from CLOB host)
@@ -311,11 +396,11 @@ struct ClientInner<S: State> {
     /// The inner [`ReqwestClient`] used to make requests to `host`.
     client: ReqwestClient,
     /// Local cache of [`TickSize`] per token ID
-    tick_sizes: DashMap<String, TickSize>,
+    tick_sizes: DashMap<U256, TickSize>,
     /// Local cache representing whether this token is part of a `neg_risk` market
-    neg_risk: DashMap<String, bool>,
+    neg_risk: DashMap<U256, bool>,
     /// Local cache representing the fee rate in basis points per token ID
-    fee_rate_bps: DashMap<String, u32>,
+    fee_rate_bps: DashMap<U256, u32>,
     /// The funder for this [`ClientInner`]. If funder is present, then `signature_type` cannot
     /// be [`SignatureType::Eoa`]. Conversely, if funder is absent, then `signature_type` cannot be
     /// [`SignatureType::Proxy`] or [`SignatureType::GnosisSafe`].
@@ -393,17 +478,106 @@ impl ClientInner<Unauthenticated> {
 }
 
 impl<S: State> Client<S> {
+    /// Returns the CLOB API host URL.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use polymarket_client_sdk::clob::{Client, Config};
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let client = Client::new("https://clob.polymarket.com", Config::default())?;
+    /// println!("Host: {}", client.host());
+    /// # Ok(())
+    /// # }
+    /// ```
     #[must_use]
     pub fn host(&self) -> &Url {
         &self.inner.host
     }
 
+    /// Invalidates all internal caches (tick sizes, neg risk flags, and fee rates).
+    ///
+    /// This method clears the cached market configuration data, forcing subsequent
+    /// requests to fetch fresh data from the API. Use this when you suspect
+    /// cached data may be stale.
     pub fn invalidate_internal_caches(&self) {
         self.inner.tick_sizes.clear();
         self.inner.fee_rate_bps.clear();
         self.inner.neg_risk.clear();
     }
 
+    /// Pre-populates the tick size cache for a token, avoiding the HTTP call.
+    ///
+    /// Use this when you already have the tick size data from another source
+    /// (e.g., cached locally or retrieved from a different API).
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use polymarket_client_sdk::clob::{Client, Config, types::TickSize};
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// use polymarket_client_sdk::types::U256;
+    ///
+    /// let client = Client::new("https://clob.polymarket.com", Config::default())?;
+    /// client.set_tick_size(U256::ZERO, TickSize::Hundredth);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn set_tick_size(&self, token_id: U256, tick_size: TickSize) {
+        self.inner.tick_sizes.insert(token_id, tick_size);
+    }
+
+    /// Pre-populates the neg risk cache for a token, avoiding the HTTP call.
+    ///
+    /// Use this when you already have the neg risk data from another source
+    /// (e.g., cached locally or retrieved from a different API).
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use polymarket_client_sdk::clob::{Client, Config};
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// use polymarket_client_sdk::types::U256;
+    ///
+    /// let client = Client::new("https://clob.polymarket.com", Config::default())?;
+    /// client.set_neg_risk(U256::ZERO, true);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn set_neg_risk(&self, token_id: U256, neg_risk: bool) {
+        self.inner.neg_risk.insert(token_id, neg_risk);
+    }
+
+    /// Pre-populates the fee rate cache for a token, avoiding the HTTP call.
+    ///
+    /// Use this when you already have the fee rate data from another source
+    /// (e.g., cached locally or retrieved from a different API). The fee rate
+    /// is specified in basis points (bps), where 100 bps = 1%.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use polymarket_client_sdk::clob::{Client, Config};
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// use polymarket_client_sdk::types::U256;
+    ///
+    /// let client = Client::new("https://clob.polymarket.com", Config::default())?;
+    /// client.set_fee_rate_bps(U256::ZERO, 10); // 0.10% fee
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn set_fee_rate_bps(&self, token_id: U256, fee_rate_bps: u32) {
+        self.inner.fee_rate_bps.insert(token_id, fee_rate_bps);
+    }
+
+    /// Checks if the CLOB API is healthy and operational.
+    ///
+    /// Returns "OK" if the API is functioning properly. This method is useful
+    /// for health checks and monitoring the API status.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the network request fails or the API is unreachable.
     pub async fn ok(&self) -> Result<String> {
         let request = self
             .client()
@@ -413,20 +587,42 @@ impl<S: State> Client<S> {
         crate::request(&self.inner.client, request, None).await
     }
 
+    /// Returns the current server timestamp in milliseconds since Unix epoch.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails.
     pub async fn server_time(&self) -> Result<Timestamp> {
         self.inner.server_time().await
     }
 
+    /// Retrieves the midpoint price for a single market outcome token.
+    ///
+    /// The midpoint is the average of the best bid and best ask prices,
+    /// calculated as `(best_bid + best_ask) / 2`. This represents a fair
+    /// market price estimate for the token.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or the token ID is invalid.
     pub async fn midpoint(&self, request: &MidpointRequest) -> Result<MidpointResponse> {
+        let params = request.query_params(None);
         let request = self
             .client()
-            .request(Method::GET, format!("{}midpoint", self.host()))
-            .query(&[("token_id", request.token_id.as_str())])
+            .request(Method::GET, format!("{}midpoint{params}", self.host()))
             .build()?;
 
         crate::request(&self.inner.client, request, None).await
     }
 
+    /// Retrieves midpoint prices for multiple market outcome tokens in a single request.
+    ///
+    /// This is the batch version of [`Self::midpoint`]. Returns midpoint prices
+    /// for all requested tokens, allowing efficient bulk price queries.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or any token ID is invalid.
     pub async fn midpoints(&self, requests: &[MidpointRequest]) -> Result<MidpointsResponse> {
         let request = self
             .client()
@@ -437,19 +633,32 @@ impl<S: State> Client<S> {
         crate::request(&self.inner.client, request, None).await
     }
 
+    /// Retrieves the current price for a market outcome token on a specific side.
+    ///
+    /// Returns the best available price for buying (BUY side) or selling (SELL side)
+    /// the specified token. This reflects the actual executable price on the orderbook.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or the token ID is invalid.
     pub async fn price(&self, request: &PriceRequest) -> Result<PriceResponse> {
+        let params = request.query_params(None);
         let request = self
             .client()
-            .request(Method::GET, format!("{}price", self.host()))
-            .query(&[
-                ("token_id", request.token_id.as_str()),
-                ("side", &request.side.to_string()),
-            ])
+            .request(Method::GET, format!("{}price{params}", self.host()))
             .build()?;
 
         crate::request(&self.inner.client, request, None).await
     }
 
+    /// Retrieves prices for multiple market outcome tokens on their specific sides.
+    ///
+    /// This is the batch version of [`Self::price`]. Allows querying prices
+    /// for many tokens at once, with each request specifying its own side (BUY or SELL).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or any token ID is invalid.
     pub async fn prices(&self, requests: &[PriceRequest]) -> Result<PricesResponse> {
         let request = self
             .client()
@@ -460,6 +669,14 @@ impl<S: State> Client<S> {
         crate::request(&self.inner.client, request, None).await
     }
 
+    /// Retrieves prices for all available market outcome tokens.
+    ///
+    /// Returns the current best bid and ask prices for every active token
+    /// in the system. This is useful for getting a complete market overview.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails.
     pub async fn all_prices(&self) -> Result<PricesResponse> {
         let request = self
             .client()
@@ -469,43 +686,54 @@ impl<S: State> Client<S> {
         crate::request(&self.inner.client, request, None).await
     }
 
+    /// Retrieves historical price data for a market.
+    ///
+    /// Returns time-series price data over a specified time range or interval.
+    /// The `fidelity` parameter controls the granularity of data points returned.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or the market ID is invalid.
     pub async fn price_history(
         &self,
         request: &PriceHistoryRequest,
     ) -> Result<PriceHistoryResponse> {
-        use crate::clob::types::TimeRange;
-
-        let mut req = self
-            .client()
-            .request(Method::GET, format!("{}prices-history", self.host()))
-            .query(&[("market", request.market.as_str())]);
-
-        match request.time_range {
-            TimeRange::Interval { interval } => {
-                req = req.query(&[("interval", interval.to_string())]);
-            }
-            TimeRange::Range { start_ts, end_ts } => {
-                req = req.query(&[("startTs", start_ts), ("endTs", end_ts)]);
-            }
-        }
-
-        if let Some(fidelity) = request.fidelity {
-            req = req.query(&[("fidelity", fidelity)]);
-        }
+        let params = request.query_params(None);
+        let req = self.client().request(
+            Method::GET,
+            format!("{}prices-history{params}", self.host()),
+        );
 
         crate::request(&self.inner.client, req.build()?, None).await
     }
 
+    /// Retrieves the bid-ask spread for a single market outcome token.
+    ///
+    /// The spread is the difference between the best ask price and the best bid price,
+    /// representing the cost of immediate execution. A smaller spread indicates higher
+    /// liquidity and more efficient markets.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or the token ID is invalid.
     pub async fn spread(&self, request: &SpreadRequest) -> Result<SpreadResponse> {
+        let params = request.query_params(None);
         let request = self
             .client()
-            .request(Method::GET, format!("{}spread", self.host()))
-            .query(&[("token_id", request.token_id.as_str())])
+            .request(Method::GET, format!("{}spread{params}", self.host()))
             .build()?;
 
         crate::request(&self.inner.client, request, None).await
     }
 
+    /// Retrieves bid-ask spreads for multiple market outcome tokens.
+    ///
+    /// This is the batch version of [`Self::spread`], allowing efficient
+    /// retrieval of spread data for many tokens simultaneously.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or any token ID is invalid.
     pub async fn spreads(&self, requests: &[SpreadRequest]) -> Result<SpreadsResponse> {
         let request = self
             .client()
@@ -516,8 +744,17 @@ impl<S: State> Client<S> {
         crate::request(&self.inner.client, request, None).await
     }
 
-    pub async fn tick_size(&self, token_id: &str) -> Result<TickSizeResponse> {
-        if let Some(tick_size) = self.inner.tick_sizes.get(token_id) {
+    /// Retrieves the minimum tick size for a market outcome token.
+    ///
+    /// The tick size defines the minimum price increment for orders on this token.
+    /// Results are cached internally to reduce API calls. For example, a tick size
+    /// of 0.01 means prices must be in increments of $0.01.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or the token ID is invalid.
+    pub async fn tick_size(&self, token_id: U256) -> Result<TickSizeResponse> {
+        if let Some(tick_size) = self.inner.tick_sizes.get(&token_id) {
             #[cfg(feature = "tracing")]
             tracing::trace!(token_id = %token_id, tick_size = ?tick_size.value(), "cache hit: tick_size");
             return Ok(TickSizeResponse {
@@ -531,7 +768,7 @@ impl<S: State> Client<S> {
         let request = self
             .client()
             .request(Method::GET, format!("{}tick-size", self.host()))
-            .query(&[("token_id", token_id)])
+            .query(&[("token_id", token_id.to_string())])
             .build()?;
 
         let response =
@@ -539,7 +776,7 @@ impl<S: State> Client<S> {
 
         self.inner
             .tick_sizes
-            .insert(token_id.to_owned(), response.minimum_tick_size);
+            .insert(token_id, response.minimum_tick_size);
 
         #[cfg(feature = "tracing")]
         tracing::trace!(token_id = %token_id, "cached tick_size");
@@ -547,8 +784,17 @@ impl<S: State> Client<S> {
         Ok(response)
     }
 
-    pub async fn neg_risk(&self, token_id: &str) -> Result<NegRiskResponse> {
-        if let Some(neg_risk) = self.inner.neg_risk.get(token_id) {
+    /// Checks if a market outcome token uses the negative risk (`NegRisk`) adapter.
+    ///
+    /// `NegRisk` markets have special settlement logic where one outcome is
+    /// "negative" (representing an event not happening). Returns `true` if the
+    /// token requires the `NegRisk` adapter contract. Results are cached internally.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or the token ID is invalid.
+    pub async fn neg_risk(&self, token_id: U256) -> Result<NegRiskResponse> {
+        if let Some(neg_risk) = self.inner.neg_risk.get(&token_id) {
             #[cfg(feature = "tracing")]
             tracing::trace!(token_id = %token_id, neg_risk = *neg_risk, "cache hit: neg_risk");
             return Ok(NegRiskResponse {
@@ -562,14 +808,12 @@ impl<S: State> Client<S> {
         let request = self
             .client()
             .request(Method::GET, format!("{}neg-risk", self.host()))
-            .query(&[("token_id", token_id)])
+            .query(&[("token_id", token_id.to_string())])
             .build()?;
 
         let response = crate::request::<NegRiskResponse>(&self.inner.client, request, None).await?;
 
-        self.inner
-            .neg_risk
-            .insert(token_id.to_owned(), response.neg_risk);
+        self.inner.neg_risk.insert(token_id, response.neg_risk);
 
         #[cfg(feature = "tracing")]
         tracing::trace!(token_id = %token_id, "cached neg_risk");
@@ -577,8 +821,16 @@ impl<S: State> Client<S> {
         Ok(response)
     }
 
-    pub async fn fee_rate_bps(&self, token_id: &str) -> Result<FeeRateResponse> {
-        if let Some(base_fee) = self.inner.fee_rate_bps.get(token_id) {
+    /// Retrieves the trading fee rate for a market outcome token.
+    ///
+    /// Returns the fee rate in basis points (bps) charged on trades for this token.
+    /// For example, 10 bps = 0.10% fee. Results are cached internally to reduce API calls.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or the token ID is invalid.
+    pub async fn fee_rate_bps(&self, token_id: U256) -> Result<FeeRateResponse> {
+        if let Some(base_fee) = self.inner.fee_rate_bps.get(&token_id) {
             #[cfg(feature = "tracing")]
             tracing::trace!(token_id = %token_id, base_fee = *base_fee, "cache hit: fee_rate_bps");
             return Ok(FeeRateResponse {
@@ -592,14 +844,12 @@ impl<S: State> Client<S> {
         let request = self
             .client()
             .request(Method::GET, format!("{}fee-rate", self.host()))
-            .query(&[("token_id", token_id)])
+            .query(&[("token_id", token_id.to_string())])
             .build()?;
 
         let response = crate::request::<FeeRateResponse>(&self.inner.client, request, None).await?;
 
-        self.inner
-            .fee_rate_bps
-            .insert(token_id.to_owned(), response.base_fee);
+        self.inner.fee_rate_bps.insert(token_id, response.base_fee);
 
         #[cfg(feature = "tracing")]
         tracing::trace!(token_id = %token_id, "cached fee_rate_bps");
@@ -663,19 +913,36 @@ impl<S: State> Client<S> {
         crate::request(&self.inner.client, request, None).await
     }
 
+    /// Retrieves the full orderbook for a market outcome token.
+    ///
+    /// Returns all active bids and asks at various price levels, showing
+    /// the depth of liquidity available in the market. This includes the
+    /// best bid, best ask, and the full order depth on both sides.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or the token ID is invalid.
     pub async fn order_book(
         &self,
         request: &OrderBookSummaryRequest,
     ) -> Result<OrderBookSummaryResponse> {
+        let params = request.query_params(None);
         let request = self
             .client()
-            .request(Method::GET, format!("{}book", self.host()))
-            .query(&[("token_id", request.token_id.as_str())])
+            .request(Method::GET, format!("{}book{params}", self.host()))
             .build()?;
 
         crate::request(&self.inner.client, request, None).await
     }
 
+    /// Retrieves orderbooks for multiple market outcome tokens.
+    ///
+    /// This is the batch version of [`Self::order_book`], allowing efficient
+    /// retrieval of orderbook data for many tokens in a single request.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or any token ID is invalid.
     pub async fn order_books(
         &self,
         requests: &[OrderBookSummaryRequest],
@@ -689,19 +956,38 @@ impl<S: State> Client<S> {
         crate::request(&self.inner.client, request, None).await
     }
 
+    /// Retrieves the price of the most recent trade for a market outcome token.
+    ///
+    /// Returns the last executed trade price, which represents the most recent
+    /// market consensus price. This is useful for tracking real-time price movements.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or the token ID is invalid.
     pub async fn last_trade_price(
         &self,
         request: &LastTradePriceRequest,
     ) -> Result<LastTradePriceResponse> {
+        let params = request.query_params(None);
         let request = self
             .client()
-            .request(Method::GET, format!("{}last-trade-price", self.host()))
-            .query(&[("token_id", request.token_id.as_str())])
+            .request(
+                Method::GET,
+                format!("{}last-trade-price{params}", self.host()),
+            )
             .build()?;
 
         crate::request(&self.inner.client, request, None).await
     }
 
+    /// Retrieves the last trade prices for multiple market outcome tokens.
+    ///
+    /// This is the batch version of [`Self::last_trade_price`], returning
+    /// the most recent executed trade price for each requested token.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or any token ID is invalid.
     pub async fn last_trades_prices(
         &self,
         token_ids: &[LastTradePriceRequest],
@@ -715,6 +1001,14 @@ impl<S: State> Client<S> {
         crate::request(&self.inner.client, request, None).await
     }
 
+    /// Retrieves detailed information for a single market by condition ID.
+    ///
+    /// Returns comprehensive market data including all outcome tokens, current prices,
+    /// volume, and market metadata. The condition ID uniquely identifies the market.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or the condition ID is invalid.
     pub async fn market(&self, condition_id: &str) -> Result<MarketResponse> {
         let request = self
             .client()
@@ -727,6 +1021,15 @@ impl<S: State> Client<S> {
         crate::request(&self.inner.client, request, None).await
     }
 
+    /// Retrieves a page of all active markets.
+    ///
+    /// Returns a paginated list of all markets with their full details.
+    /// Use the `next_cursor` from the response to fetch subsequent pages.
+    /// Useful for iterating through all available markets.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails.
     pub async fn markets(&self, next_cursor: Option<String>) -> Result<Page<MarketResponse>> {
         let cursor = next_cursor.map_or(String::new(), |c| format!("?next_cursor={c}"));
         let request = self
@@ -737,6 +1040,15 @@ impl<S: State> Client<S> {
         crate::request(&self.inner.client, request, None).await
     }
 
+    /// Retrieves a page of sampling markets.
+    ///
+    /// Returns a paginated list of markets designated for the sampling program,
+    /// where market makers can earn rewards. Use the `next_cursor` from the
+    /// response to fetch subsequent pages.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails.
     pub async fn sampling_markets(
         &self,
         next_cursor: Option<String>,
@@ -753,6 +1065,15 @@ impl<S: State> Client<S> {
         crate::request(&self.inner.client, request, None).await
     }
 
+    /// Retrieves a page of simplified market data.
+    ///
+    /// Returns a paginated list of markets with reduced detail, providing only
+    /// essential information for faster queries and lower bandwidth usage.
+    /// Use the `next_cursor` from the response to fetch subsequent pages.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails.
     pub async fn simplified_markets(
         &self,
         next_cursor: Option<String>,
@@ -769,6 +1090,15 @@ impl<S: State> Client<S> {
         crate::request(&self.inner.client, request, None).await
     }
 
+    /// Retrieves a page of simplified sampling market data.
+    ///
+    /// Returns a paginated list of sampling program markets with reduced detail.
+    /// Combines the efficiency of simplified queries with the filtering of
+    /// sampling markets. Use the `next_cursor` from the response to fetch subsequent pages.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails.
     pub async fn sampling_simplified_markets(
         &self,
         next_cursor: Option<String>,
@@ -822,6 +1152,31 @@ impl<S: State> Client<S> {
 }
 
 impl Client<Unauthenticated> {
+    /// Creates a new unauthenticated CLOB client.
+    ///
+    /// This client can access public API endpoints like market data, prices,
+    /// and orderbooks. To place orders or access user-specific endpoints,
+    /// use [`Self::authentication_builder`] to upgrade to an authenticated client.
+    ///
+    /// # Arguments
+    ///
+    /// * `host` - The CLOB API URL (e.g., <https://clob.polymarket.com>)
+    /// * `config` - Client configuration options
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the host URL is invalid or the HTTP client cannot be initialized.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use polymarket_client_sdk::clob::{Client, Config};
+    ///
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let client = Client::new("https://clob.polymarket.com", Config::default())?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn new(host: &str, config: Config) -> Result<Client<Unauthenticated>> {
         let mut headers = HeaderMap::new();
 
@@ -853,9 +1208,39 @@ impl Client<Unauthenticated> {
                 signature_type: SignatureType::Eoa,
                 salt_generator: generate_seed,
             }),
+            #[cfg(feature = "heartbeats")]
+            heartbeat_token: DroppingCancellationToken(None),
         })
     }
 
+    /// Creates an authentication builder to upgrade this client to authenticated mode.
+    ///
+    /// Returns an [`AuthenticationBuilder`] that can be configured with credentials
+    /// or used to create/derive API keys. Call [`AuthenticationBuilder::authenticate`]
+    /// to complete the upgrade to an authenticated client.
+    ///
+    /// # Arguments
+    ///
+    /// * `signer` - A wallet signer used to generate authentication signatures
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use polymarket_client_sdk::clob::{Client, Config};
+    /// use alloy::signers::local::LocalSigner;
+    /// use std::str::FromStr;
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let client = Client::new("https://clob.polymarket.com", Config::default())?;
+    /// let signer = LocalSigner::from_str("0x...")?;
+    ///
+    /// let authenticated_client = client
+    ///     .authentication_builder(&signer)
+    ///     .authenticate()
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn authentication_builder<S: Signer>(
         self,
         signer: &S,
@@ -906,8 +1291,20 @@ impl Client<Unauthenticated> {
 
 impl<K: Kind> Client<Authenticated<K>> {
     /// Demotes this authenticated [`Client<Authenticated<K>>`] to an unauthenticated one
-    pub fn deauthenticate(self) -> Result<Client<Unauthenticated>> {
+    #[cfg_attr(
+        not(feature = "heartbeats"),
+        expect(
+            clippy::unused_async,
+            unused_mut,
+            reason = "Nothing to await or modify when heartbeats are disabled"
+        )
+    )]
+    pub async fn deauthenticate(mut self) -> Result<Client<Unauthenticated>> {
+        #[cfg(feature = "heartbeats")]
+        self.heartbeat_token.cancel_and_wait().await?;
+
         let inner = Arc::into_inner(self.inner).ok_or(Synchronization)?;
+
         Ok(Client::<Unauthenticated> {
             inner: Arc::new(ClientInner {
                 state: Unauthenticated,
@@ -923,14 +1320,24 @@ impl<K: Kind> Client<Authenticated<K>> {
                 signature_type: SignatureType::Eoa,
                 salt_generator: generate_seed,
             }),
+            #[cfg(feature = "heartbeats")]
+            heartbeat_token: DroppingCancellationToken(None),
         })
     }
 
+    /// Returns a reference to the authenticated state.
+    ///
+    /// Provides access to authentication details including the wallet address
+    /// and credentials used by this client.
     #[must_use]
     pub fn state(&self) -> &Authenticated<K> {
         &self.inner.state
     }
 
+    /// Returns the wallet address associated with this authenticated client.
+    ///
+    /// This is the address that was used to authenticate and will be used
+    /// for signing orders and other authenticated operations.
     #[must_use]
     pub fn address(&self) -> Address {
         self.state().address
@@ -948,6 +1355,14 @@ impl<K: Kind> Client<Authenticated<K>> {
         crate::request(&self.inner.client, request, Some(headers)).await
     }
 
+    /// Deletes the current API key used by this authenticated client.
+    ///
+    /// After deletion, this client will no longer be able to access authenticated
+    /// endpoints. You will need to create or derive a new API key to continue.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or the API key cannot be deleted.
     pub async fn delete_api_key(&self) -> Result<serde_json::Value> {
         let request = self
             .client()
@@ -958,6 +1373,15 @@ impl<K: Kind> Client<Authenticated<K>> {
         crate::request(&self.inner.client, request, Some(headers)).await
     }
 
+    /// Checks if the account is in closed-only mode (banned from opening new positions).
+    ///
+    /// Returns the ban status indicating whether the user can only close existing
+    /// positions or is allowed to open new positions. Users in closed-only mode
+    /// can cancel orders and close positions but cannot create new positions.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails.
     pub async fn closed_only_mode(&self) -> Result<BanStatusResponse> {
         let request = self
             .client()
@@ -992,10 +1416,14 @@ impl<K: Kind> Client<Authenticated<K>> {
     pub async fn sign<S: Signer>(
         &self,
         signer: &S,
-        SignableOrder { order, order_type }: SignableOrder,
+        SignableOrder {
+            order,
+            order_type,
+            post_only,
+        }: SignableOrder,
     ) -> Result<SignedOrder> {
-        let token_id = order.tokenId.to_string();
-        let neg_risk = self.neg_risk(&token_id).await?.neg_risk;
+        let token_id = order.tokenId;
+        let neg_risk = self.neg_risk(token_id).await?.neg_risk;
         let chain_id = signer
             .chain_id()
             .expect("Validated not none in `authenticate`");
@@ -1021,9 +1449,23 @@ impl<K: Kind> Client<Authenticated<K>> {
             signature,
             order_type,
             owner: self.state().credentials.key,
+            post_only,
         })
     }
 
+    /// Posts a signed order to the orderbook.
+    ///
+    /// Submits a single limit or market order that has been signed with the
+    /// user's wallet. The order will be validated and added to the orderbook
+    /// if it meets all requirements (sufficient balance, valid price, etc.).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The order signature is invalid
+    /// - The user has insufficient balance or allowance
+    /// - The order price/size violates market rules
+    /// - The request fails
     pub async fn post_order(&self, order: SignedOrder) -> Result<PostOrderResponse> {
         let request = self
             .client()
@@ -1035,6 +1477,15 @@ impl<K: Kind> Client<Authenticated<K>> {
         crate::request(&self.inner.client, request, Some(headers)).await
     }
 
+    /// Posts multiple signed orders to the orderbook in a single request.
+    ///
+    /// This is the batch version of [`Self::post_order`], allowing efficient
+    /// submission of multiple orders at once. All orders are validated and
+    /// processed atomically.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any order fails validation or the request fails.
     pub async fn post_orders(&self, orders: Vec<SignedOrder>) -> Result<Vec<PostOrderResponse>> {
         let request = self
             .client()
@@ -1057,6 +1508,15 @@ impl<K: Kind> Client<Authenticated<K>> {
         crate::request(&self.inner.client, request, Some(headers)).await
     }
 
+    /// Retrieves a paginated list of orders matching the specified criteria.
+    ///
+    /// Returns orders filtered by token ID, market condition, or other parameters
+    /// specified in the request. Use the `next_cursor` from the response to fetch
+    /// subsequent pages.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails.
     pub async fn orders(
         &self,
         request: &OrdersRequest,
@@ -1072,6 +1532,15 @@ impl<K: Kind> Client<Authenticated<K>> {
         crate::request(&self.inner.client, request, Some(headers)).await
     }
 
+    /// Cancels a single order by its order ID.
+    ///
+    /// Removes an open order from the orderbook. The order must belong to
+    /// the authenticated user and must still be active (not filled or expired).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the order ID is invalid, the order doesn't exist,
+    /// or the request fails.
     pub async fn cancel_order(&self, order_id: &str) -> Result<CancelOrdersResponse> {
         let request = self
             .client()
@@ -1083,6 +1552,15 @@ impl<K: Kind> Client<Authenticated<K>> {
         crate::request(&self.inner.client, request, Some(headers)).await
     }
 
+    /// Cancels multiple orders by their order IDs in a single request.
+    ///
+    /// This is the batch version of [`Self::cancel_order`], allowing efficient
+    /// cancellation of many orders at once. All specified orders must belong
+    /// to the authenticated user.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any order ID is invalid or the request fails.
     pub async fn cancel_orders(&self, order_ids: &[&str]) -> Result<CancelOrdersResponse> {
         let request = self
             .client()
@@ -1094,6 +1572,14 @@ impl<K: Kind> Client<Authenticated<K>> {
         crate::request(&self.inner.client, request, Some(headers)).await
     }
 
+    /// Cancels all open orders for the authenticated user.
+    ///
+    /// Removes every active order from the orderbook for this account.
+    /// Use with caution as this operation cannot be undone.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails.
     pub async fn cancel_all_orders(&self) -> Result<CancelOrdersResponse> {
         let request = self
             .client()
@@ -1123,6 +1609,15 @@ impl<K: Kind> Client<Authenticated<K>> {
         crate::request(&self.inner.client, request, Some(headers)).await
     }
 
+    /// Retrieves a paginated list of trades for the authenticated user.
+    ///
+    /// Returns executed trades filtered by the criteria in the request (token ID,
+    /// market, maker/taker side, etc.). Use the `next_cursor` from the response
+    /// to fetch subsequent pages.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails.
     pub async fn trades(
         &self,
         request: &TradesRequest,
@@ -1138,6 +1633,14 @@ impl<K: Kind> Client<Authenticated<K>> {
         crate::request(&self.inner.client, request, Some(headers)).await
     }
 
+    /// Retrieves all notifications for the authenticated user.
+    ///
+    /// Returns order fill notifications, cancellations, and other trading events.
+    /// Notifications help track order status changes asynchronously.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails.
     pub async fn notifications(&self) -> Result<Vec<NotificationResponse>> {
         let request = self
             .client()
@@ -1149,6 +1652,14 @@ impl<K: Kind> Client<Authenticated<K>> {
         crate::request(&self.inner.client, request, Some(headers)).await
     }
 
+    /// Deletes notifications matching the specified IDs.
+    ///
+    /// Removes notifications from the user's notification list. This is useful
+    /// for cleaning up old notifications after they've been processed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or the notification IDs are invalid.
     pub async fn delete_notifications(&self, request: &DeleteNotificationsRequest) -> Result<()> {
         let params = request.query_params(None);
         let mut request = self
@@ -1169,6 +1680,15 @@ impl<K: Kind> Client<Authenticated<K>> {
         Ok(())
     }
 
+    /// Retrieves the user's USDC balance and token allowances.
+    ///
+    /// Returns the current USDC balance in the user's wallet and the allowance
+    /// granted to the CLOB exchange contract. The allowance must be sufficient
+    /// to place orders. This query updates internal cached balance state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails.
     pub async fn balance_allowance(
         &self,
         mut request: BalanceAllowanceRequest,
@@ -1190,6 +1710,15 @@ impl<K: Kind> Client<Authenticated<K>> {
         crate::request(&self.inner.client, request, Some(headers)).await
     }
 
+    /// Forces an update of the cached balance and allowance data.
+    ///
+    /// Triggers the CLOB backend to refresh its cached view of the user's
+    /// on-chain balance and allowances. Use this after approving tokens or
+    /// depositing USDC to ensure the exchange recognizes the updated state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails.
     pub async fn update_balance_allowance(
         &self,
         mut request: UpdateBalanceAllowanceRequest,
@@ -1217,6 +1746,15 @@ impl<K: Kind> Client<Authenticated<K>> {
         Ok(())
     }
 
+    /// Checks if an order is eligible for market maker rewards.
+    ///
+    /// Returns whether the specified order qualifies for the sampling program
+    /// rewards based on its market, size, and other criteria. Only certain markets
+    /// and order sizes are eligible for rewards.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the order ID is invalid or the request fails.
     pub async fn is_order_scoring(&self, order_id: &str) -> Result<OrderScoringResponse> {
         let request = self
             .client()
@@ -1228,6 +1766,14 @@ impl<K: Kind> Client<Authenticated<K>> {
         crate::request(&self.inner.client, request, Some(headers)).await
     }
 
+    /// Checks if multiple orders are eligible for market maker rewards.
+    ///
+    /// This is the batch version of [`Self::is_order_scoring`], allowing efficient
+    /// checking of reward eligibility for many orders at once.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any order ID is invalid or the request fails.
     pub async fn are_orders_scoring(&self, order_ids: &[&str]) -> Result<OrdersScoringResponse> {
         let request = self
             .client()
@@ -1239,6 +1785,14 @@ impl<K: Kind> Client<Authenticated<K>> {
         crate::request(&self.inner.client, request, Some(headers)).await
     }
 
+    /// Retrieves detailed market maker earnings for a specific day.
+    ///
+    /// Returns a paginated list of reward earnings broken down by market and order
+    /// for the specified date. Use this to track individual reward-earning orders.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or the date format is invalid.
     pub async fn earnings_for_user_for_day(
         &self,
         date: NaiveDate,
@@ -1261,6 +1815,14 @@ impl<K: Kind> Client<Authenticated<K>> {
         crate::request(&self.inner.client, request, Some(headers)).await
     }
 
+    /// Retrieves total market maker earnings summary for a specific day.
+    ///
+    /// Returns aggregated reward totals for the specified date, providing a
+    /// high-level view of earnings without per-order details.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or the date format is invalid.
     pub async fn total_earnings_for_user_for_day(
         &self,
         date: NaiveDate,
@@ -1281,6 +1843,14 @@ impl<K: Kind> Client<Authenticated<K>> {
         crate::request(&self.inner.client, request, Some(headers)).await
     }
 
+    /// Retrieves user earnings along with market reward configurations.
+    ///
+    /// Returns earnings data combined with the reward configuration for each market,
+    /// helping understand which markets offer rewards and their earning potential.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails.
     pub async fn user_earnings_and_markets_config(
         &self,
         request: &UserRewardsEarningRequest,
@@ -1303,6 +1873,14 @@ impl<K: Kind> Client<Authenticated<K>> {
         crate::request(&self.inner.client, request, Some(headers)).await
     }
 
+    /// Retrieves the user's current reward earning percentages.
+    ///
+    /// Returns the percentage of total rewards the user is earning across
+    /// different markets, indicating market making performance relative to others.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails.
     pub async fn reward_percentages(&self) -> Result<RewardsPercentagesResponse> {
         let request = self
             .client()
@@ -1320,6 +1898,15 @@ impl<K: Kind> Client<Authenticated<K>> {
         crate::request(&self.inner.client, request, Some(headers)).await
     }
 
+    /// Retrieves current active reward programs and their configurations.
+    ///
+    /// Returns information about ongoing reward programs, including eligible markets,
+    /// reward amounts, and program parameters. Use this to discover opportunities
+    /// for earning market maker rewards.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails.
     pub async fn current_rewards(
         &self,
         next_cursor: Option<String>,
@@ -1337,6 +1924,14 @@ impl<K: Kind> Client<Authenticated<K>> {
         crate::request(&self.inner.client, request, Some(headers)).await
     }
 
+    /// Retrieves detailed reward data for a specific market.
+    ///
+    /// Returns the reward configuration and earning details for orders in the
+    /// specified market condition. Useful for tracking rewards on a per-market basis.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the condition ID is invalid or the request fails.
     pub async fn raw_rewards_for_market(
         &self,
         condition_id: &str,
@@ -1355,6 +1950,15 @@ impl<K: Kind> Client<Authenticated<K>> {
         crate::request(&self.inner.client, request, Some(headers)).await
     }
 
+    /// Creates a new Builder API key for order attribution.
+    ///
+    /// Builder API keys allow you to attribute orders to your builder account,
+    /// enabling tracking of order flow and potential builder rewards. This is
+    /// separate from regular API keys used for trading.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or the account is not eligible for builder keys.
     pub async fn create_builder_api_key(&self) -> Result<Credentials> {
         let request = self
             .client()
@@ -1363,6 +1967,118 @@ impl<K: Kind> Client<Authenticated<K>> {
         let headers = self.create_headers(&request).await?;
 
         crate::request(&self.inner.client, request, Some(headers)).await
+    }
+
+    /// Posts a heartbeat to maintain order liveness.
+    ///
+    /// Heartbeats signal that your trading application is actively monitoring markets.
+    /// Regular heartbeats (every 5-10 seconds) ensure your orders maintain priority
+    /// in the orderbook. If heartbeats stop, orders may lose priority or be cancelled.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails.
+    pub async fn post_heartbeat(&self, heartbeat_id: Option<Uuid>) -> Result<HeartbeatResponse> {
+        let request = self
+            .client()
+            .request(Method::POST, format!("{}v1/heartbeats", self.host()))
+            .json(&json!({ "heartbeat_id": heartbeat_id }))
+            .build()?;
+        let headers = self.create_headers(&request).await?;
+
+        crate::request(&self.inner.client, request, Some(headers)).await
+    }
+
+    #[cfg(feature = "heartbeats")]
+    /// Checks if automatic heartbeats are currently active.
+    ///
+    /// Returns `true` if the heartbeat background task is running, `false` otherwise.
+    /// Requires the `heartbeats` feature to be enabled.
+    #[must_use]
+    pub fn heartbeats_active(&self) -> bool {
+        self.heartbeat_token.0.is_some()
+    }
+
+    #[cfg(feature = "heartbeats")]
+    /// Starts automatic heartbeat posting in the background.
+    ///
+    /// Spawns a background task that automatically posts heartbeats at the configured
+    /// interval. This maintains order priority without manual intervention. The heartbeat
+    /// interval is configured in [`Config`]'s `heartbeat_interval`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if heartbeats are already active.
+    ///
+    /// # Note
+    ///
+    /// Requires the `heartbeats` feature to be enabled.
+    pub fn start_heartbeats(client: &mut Client<Authenticated<K>>) -> Result<()> {
+        if client.heartbeats_active() {
+            return Err(Error::validation("Unable to create another heartbeat task"));
+        }
+
+        let token = CancellationToken::new();
+        let duration = client.inner.config.heartbeat_interval;
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+
+        let token_clone = token.clone();
+        let client_clone = client.clone();
+
+        tokio::task::spawn(async move {
+            let mut heartbeat_id: Option<Uuid> = None;
+
+            let mut ticker = time::interval(duration);
+            ticker.tick().await;
+
+            loop {
+                tokio::select! {
+                    () = token_clone.cancelled() => {
+                        #[cfg(feature = "tracing")]
+                        debug!("Heartbeat cancellation requested, terminating...");
+                        break
+                    },
+                    _ = ticker.tick() => {
+                        match client_clone.post_heartbeat(heartbeat_id).await {
+                            Ok(response) => {
+                                #[cfg(feature = "tracing")]
+                                debug!("Heartbeat successfully sent: {response:?}");
+                                heartbeat_id = Some(response.heartbeat_id);
+                            },
+                            Err(e) => {
+                                #[cfg(feature = "tracing")]
+                                error!("Unable to post heartbeat: {e:?}");
+                                #[cfg(not(feature = "tracing"))]
+                                let _ = &e;
+                            }
+                        }
+                    }
+                }
+            }
+
+            tx.send(())
+        });
+
+        client.heartbeat_token = DroppingCancellationToken(Some((token, Arc::new(rx))));
+
+        Ok(())
+    }
+
+    #[cfg(feature = "heartbeats")]
+    /// Stops automatic heartbeat posting.
+    ///
+    /// Cancels the background heartbeat task and waits for it to terminate cleanly.
+    /// After stopping, you can restart heartbeats by calling [`Self::start_heartbeats`] again.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the heartbeat task cannot be stopped cleanly.
+    ///
+    /// # Note
+    ///
+    /// Requires the `heartbeats` feature to be enabled.
+    pub async fn stop_heartbeats(&mut self) -> Result<()> {
+        self.heartbeat_token.cancel_and_wait().await
     }
 
     async fn create_headers(&self, request: &Request) -> Result<HeaderMap> {
@@ -1390,8 +2106,11 @@ impl<K: Kind> Client<Authenticated<K>> {
             expiration: None,
             taker: None,
             order_type: None,
+            post_only: Some(false),
             client: Client {
                 inner: Arc::clone(&self.inner),
+                #[cfg(feature = "heartbeats")]
+                heartbeat_token: self.heartbeat_token.clone(),
             },
             _kind: PhantomData,
         }
@@ -1399,10 +2118,27 @@ impl<K: Kind> Client<Authenticated<K>> {
 }
 
 impl Client<Authenticated<Normal>> {
-    pub fn promote_to_builder(
-        self,
+    /// Convert this [`Client<Authenticated<Normal>>`] to [`Client<Authenticated<Builder>>`] using
+    /// the provided `config`.
+    ///
+    /// Note: If `heartbeats` feature flag is enabled, then this method _will_ cancel all
+    /// outstanding orders since it will disable the background heartbeats task and then
+    /// re-enable it.
+    #[cfg_attr(
+        not(feature = "heartbeats"),
+        expect(
+            clippy::unused_async,
+            unused_mut,
+            reason = "Nothing to await or modify when heartbeats are disabled"
+        )
+    )]
+    pub async fn promote_to_builder(
+        mut self,
         config: BuilderConfig,
     ) -> Result<Client<Authenticated<Builder>>> {
+        #[cfg(feature = "heartbeats")]
+        self.heartbeat_token.cancel_and_wait().await?;
+
         let inner = Arc::into_inner(self.inner).ok_or(Synchronization)?;
 
         let state = Authenticated {
@@ -1428,9 +2164,23 @@ impl Client<Authenticated<Normal>> {
             salt_generator: inner.salt_generator,
         };
 
-        Ok(Client {
+        #[cfg_attr(
+            not(feature = "heartbeats"),
+            expect(
+                unused_mut,
+                reason = "Modifier only needed when heartbeats feature is enabled"
+            )
+        )]
+        let mut client = Client {
             inner: Arc::new(new_inner),
-        })
+            #[cfg(feature = "heartbeats")]
+            heartbeat_token: DroppingCancellationToken(None),
+        };
+
+        #[cfg(feature = "heartbeats")]
+        Client::<Authenticated<Builder>>::start_heartbeats(&mut client)?;
+
+        Ok(client)
     }
 }
 
@@ -1495,8 +2245,8 @@ impl<K: Kind> Client<Authenticated<K>> {
     /// Returns an error if the HTTP request fails or the response cannot be parsed.
     pub async fn create_request(
         &self,
-        request: &crate::clob::types::CreateRfqRequestRequest,
-    ) -> Result<crate::clob::types::CreateRfqRequestResponse> {
+        request: &CreateRfqRequestRequest,
+    ) -> Result<CreateRfqRequestResponse> {
         let http_request = self
             .client()
             .request(Method::POST, format!("{}rfq/request", self.host()))
@@ -1514,10 +2264,7 @@ impl<K: Kind> Client<Authenticated<K>> {
     /// # Errors
     ///
     /// Returns an error if the HTTP request fails or the request cannot be canceled.
-    pub async fn cancel_request(
-        &self,
-        request: &crate::clob::types::CancelRfqRequestRequest,
-    ) -> Result<()> {
+    pub async fn cancel_request(&self, request: &CancelRfqRequestRequest) -> Result<()> {
         let http_request = self
             .client()
             .request(Method::DELETE, format!("{}rfq/request", self.host()))
@@ -1538,13 +2285,16 @@ impl<K: Kind> Client<Authenticated<K>> {
     /// Returns an error if the HTTP request fails or the response cannot be parsed.
     pub async fn requests(
         &self,
-        request: &crate::clob::types::RfqRequestsRequest,
+        request: &RfqRequestsRequest,
         next_cursor: Option<&str>,
-    ) -> Result<crate::clob::types::response::Page<crate::clob::types::RfqRequest>> {
+    ) -> Result<Page<RfqRequest>> {
         let params = request.query_params(next_cursor);
         let http_request = self
             .client()
-            .request(Method::GET, format!("{}rfq/request{params}", self.host()))
+            .request(
+                Method::GET,
+                format!("{}rfq/data/requests{params}", self.host()),
+            )
             .build()?;
         let headers = self.create_headers(&http_request).await?;
 
@@ -1558,8 +2308,8 @@ impl<K: Kind> Client<Authenticated<K>> {
     /// Returns an error if the HTTP request fails or the response cannot be parsed.
     pub async fn create_quote(
         &self,
-        request: &crate::clob::types::CreateRfqQuoteRequest,
-    ) -> Result<crate::clob::types::CreateRfqQuoteResponse> {
+        request: &CreateRfqQuoteRequest,
+    ) -> Result<CreateRfqQuoteResponse> {
         let http_request = self
             .client()
             .request(Method::POST, format!("{}rfq/quote", self.host()))
@@ -1575,10 +2325,7 @@ impl<K: Kind> Client<Authenticated<K>> {
     /// # Errors
     ///
     /// Returns an error if the HTTP request fails or the quote cannot be canceled.
-    pub async fn cancel_quote(
-        &self,
-        request: &crate::clob::types::CancelRfqQuoteRequest,
-    ) -> Result<()> {
+    pub async fn cancel_quote(&self, request: &CancelRfqQuoteRequest) -> Result<()> {
         let http_request = self
             .client()
             .request(Method::DELETE, format!("{}rfq/quote", self.host()))
@@ -1599,13 +2346,16 @@ impl<K: Kind> Client<Authenticated<K>> {
     /// Returns an error if the HTTP request fails or the response cannot be parsed.
     pub async fn quotes(
         &self,
-        request: &crate::clob::types::RfqQuotesRequest,
+        request: &RfqQuotesRequest,
         next_cursor: Option<&str>,
-    ) -> Result<crate::clob::types::response::Page<crate::clob::types::RfqQuote>> {
+    ) -> Result<Page<RfqQuote>> {
         let params = request.query_params(next_cursor);
         let http_request = self
             .client()
-            .request(Method::GET, format!("{}rfq/quote{params}", self.host()))
+            .request(
+                Method::GET,
+                format!("{}rfq/data/quotes{params}", self.host()),
+            )
             .build()?;
         let headers = self.create_headers(&http_request).await?;
 
@@ -1622,8 +2372,8 @@ impl<K: Kind> Client<Authenticated<K>> {
     /// Returns an error if the HTTP request fails or the quote cannot be accepted.
     pub async fn accept_quote(
         &self,
-        request: &crate::clob::types::AcceptRfqQuoteRequest,
-    ) -> Result<crate::clob::types::AcceptRfqQuoteResponse> {
+        request: &AcceptRfqQuoteRequest,
+    ) -> Result<AcceptRfqQuoteResponse> {
         let http_request = self
             .client()
             .request(Method::POST, format!("{}rfq/request/accept", self.host()))
@@ -1632,7 +2382,7 @@ impl<K: Kind> Client<Authenticated<K>> {
         let headers = self.create_headers(&http_request).await?;
 
         self.rfq_request_text(http_request, headers).await?;
-        Ok(crate::clob::types::AcceptRfqQuoteResponse)
+        Ok(AcceptRfqQuoteResponse)
     }
 
     /// Quoter approves an RFQ order during the last look window.
@@ -1644,8 +2394,8 @@ impl<K: Kind> Client<Authenticated<K>> {
     /// Returns an error if the HTTP request fails or the order cannot be approved.
     pub async fn approve_order(
         &self,
-        request: &crate::clob::types::ApproveRfqOrderRequest,
-    ) -> Result<crate::clob::types::ApproveRfqOrderResponse> {
+        request: &ApproveRfqOrderRequest,
+    ) -> Result<ApproveRfqOrderResponse> {
         let http_request = self
             .client()
             .request(Method::POST, format!("{}rfq/quote/approve", self.host()))
@@ -1662,11 +2412,7 @@ impl<K: Kind> Client<Authenticated<K>> {
     /// and accept quote which return "OK" as plain text rather than a JSON response.
     /// The standard `crate::request` helper expects JSON responses and would fail
     /// to deserialize plain text.
-    async fn rfq_request_text(
-        &self,
-        mut request: reqwest::Request,
-        headers: reqwest::header::HeaderMap,
-    ) -> Result<()> {
+    async fn rfq_request_text(&self, mut request: Request, headers: HeaderMap) -> Result<()> {
         let method = request.method().clone();
         let path = request.url().path().to_owned();
 

@@ -4,21 +4,15 @@ use serde::de::StdError;
 use serde::{Deserialize, Serialize};
 use serde_with::{StringWithSeparator, formats::CommaSeparator, serde_as};
 
-use crate::types::Decimal;
+use crate::types::{B256, Decimal};
 
 pub mod request;
 pub mod response;
 
-/// Type alias for 64-character hex hashes (condition IDs, market identifiers).
-pub type Hash64 = String;
-
-/// Type alias for market title filter strings.
-pub type Title = String;
-
 /// The side of a trade (buy or sell).
 ///
 /// Used to indicate whether a trade was a purchase or sale of outcome tokens.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, strum_macros::Display)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, strum_macros::Display)]
 #[serde(rename_all = "UPPERCASE")]
 #[strum(serialize_all = "UPPERCASE")]
 #[non_exhaustive]
@@ -27,12 +21,15 @@ pub enum Side {
     Buy,
     /// Selling outcome tokens (going short or closing a long position).
     Sell,
+    /// Unknown side from the API (captures the raw value for debugging).
+    #[serde(untagged)]
+    Unknown(String),
 }
 
 /// The type of on-chain activity for a user.
 ///
 /// Activities represent various operations that users can perform on the Polymarket protocol.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, strum_macros::Display)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, strum_macros::Display)]
 #[serde(rename_all = "UPPERCASE")]
 #[strum(serialize_all = "UPPERCASE")]
 #[non_exhaustive]
@@ -49,6 +46,13 @@ pub enum ActivityType {
     Reward,
     /// Converting between token types.
     Conversion,
+    /// Yield
+    Yield,
+    /// Maker rebate (fee rebate for providing liquidity).
+    MakerRebate,
+    /// Unknown activity type from the API (captures the raw value for debugging).
+    #[serde(untagged)]
+    Unknown(String),
 }
 
 /// Sort criteria for position queries.
@@ -260,9 +264,10 @@ pub enum LeaderboardOrderBy {
 ///
 /// ```
 /// use polymarket_client_sdk::data::types::MarketFilter;
+/// use polymarket_client_sdk::types::b256;
 ///
 /// // Filter by specific markets (condition IDs)
-/// let by_markets = MarketFilter::markets(["0xdd22472e552920b8438158ea7238bfadfa4f736aa4cee91a6b86c39ead110917".to_string()]);
+/// let by_markets = MarketFilter::markets([b256!("dd22472e552920b8438158ea7238bfadfa4f736aa4cee91a6b86c39ead110917")]);
 ///
 /// // Or filter by events (which may contain multiple markets)
 /// let by_events = MarketFilter::event_ids(["123".to_owned()]);
@@ -273,7 +278,7 @@ pub enum LeaderboardOrderBy {
 pub enum MarketFilter {
     /// Filter by condition IDs (market identifiers).
     #[serde(rename = "market")]
-    Markets(#[serde_as(as = "StringWithSeparator::<CommaSeparator, String>")] Vec<String>),
+    Markets(#[serde_as(as = "StringWithSeparator::<CommaSeparator, B256>")] Vec<B256>),
     /// Filter by event IDs (groups of related markets).
     #[serde(rename = "eventId")]
     EventIds(#[serde_as(as = "StringWithSeparator::<CommaSeparator, String>")] Vec<String>),
@@ -282,7 +287,7 @@ pub enum MarketFilter {
 impl MarketFilter {
     /// Creates a filter for specific markets by their condition IDs.
     #[must_use]
-    pub fn markets<I: IntoIterator<Item = String>>(ids: I) -> Self {
+    pub fn markets<I: IntoIterator<Item = B256>>(ids: I) -> Self {
         Self::Markets(ids.into_iter().collect())
     }
 

@@ -3,15 +3,18 @@
     reason = "Response suffix is intentional for clarity"
 )]
 
-use chrono::{DateTime, Utc};
+use bon::Builder;
+use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
-use serde_with::serde_as;
+use serde_with::NoneAsEmptyString;
+use serde_with::json::JsonString;
+use serde_with::{DisplayFromStr, StringWithSeparator, formats::CommaSeparator, serde_as};
 
 use crate::serde_helpers::StringFromAny;
-use crate::types::Decimal;
+use crate::types::{Address, B256, Decimal, U256};
 
 /// Image optimization metadata.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Builder)]
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub struct ImageOptimization {
@@ -29,7 +32,7 @@ pub struct ImageOptimization {
 }
 
 /// Pagination information.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Builder)]
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub struct Pagination {
@@ -41,7 +44,7 @@ pub struct Pagination {
 pub type HealthResponse = String;
 
 /// A sports team.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Builder)]
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub struct Team {
@@ -59,7 +62,8 @@ pub struct Team {
 }
 
 /// Sports metadata information.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde_as]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Builder)]
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub struct SportsMetadata {
@@ -68,13 +72,14 @@ pub struct SportsMetadata {
     pub image: String,
     pub resolution: String,
     pub ordering: String,
-    pub tags: String,
+    #[serde_as(as = "StringWithSeparator::<CommaSeparator, String>")]
+    pub tags: Vec<String>,
     pub series: String,
     pub created_at: Option<DateTime<Utc>>,
 }
 
 /// Sports market types response.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Builder)]
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub struct SportsMarketTypesResponse {
@@ -82,7 +87,7 @@ pub struct SportsMarketTypesResponse {
 }
 
 /// A tag for categorizing content.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Builder)]
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub struct Tag {
@@ -102,7 +107,7 @@ pub struct Tag {
 
 /// A relationship between tags.
 #[serde_as]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Builder)]
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub struct RelatedTag {
@@ -118,7 +123,7 @@ pub struct RelatedTag {
 }
 
 /// A category for organizing content.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Builder)]
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub struct Category {
@@ -134,7 +139,7 @@ pub struct Category {
 }
 
 /// An event creator.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Builder)]
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub struct EventCreator {
@@ -148,7 +153,7 @@ pub struct EventCreator {
 }
 
 /// A chat/live stream associated with an event.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Builder)]
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub struct Chat {
@@ -162,7 +167,7 @@ pub struct Chat {
 }
 
 /// A template for creating events/markets.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Builder)]
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub struct Template {
@@ -181,7 +186,7 @@ pub struct Template {
 }
 
 /// A collection of events.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Builder)]
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub struct Collection {
@@ -218,7 +223,7 @@ pub struct Collection {
 
 /// A prediction market event.
 #[serde_as]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Builder)]
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub struct Event {
@@ -272,8 +277,9 @@ pub struct Event {
     pub liquidity_amm: Option<Decimal>,
     pub liquidity_clob: Option<Decimal>,
     pub neg_risk: Option<bool>,
-    #[serde(rename = "negRiskMarketID")]
-    pub neg_risk_market_id: Option<String>,
+    #[serde_as(as = "NoneAsEmptyString")]
+    #[serde(default, rename = "negRiskMarketID")]
+    pub neg_risk_market_id: Option<B256>,
     pub neg_risk_fee_bips: Option<i32>,
     pub comment_count: Option<i32>,
     pub image_optimized: Option<ImageOptimization>,
@@ -292,7 +298,7 @@ pub struct Event {
     pub automatically_resolved: Option<bool>,
     pub enable_neg_risk: Option<bool>,
     pub automatically_active: Option<bool>,
-    pub event_date: Option<String>,
+    pub event_date: Option<NaiveDate>,
     pub start_time: Option<DateTime<Utc>>,
     pub event_week: Option<i32>,
     pub series_slug: Option<String>,
@@ -326,45 +332,54 @@ pub struct Event {
     pub country_name: Option<String>,
     pub color: Option<String>,
     pub cumulative_markets: Option<bool>,
+    pub away_team_name: Option<String>,
+    pub home_team_name: Option<String>,
 }
 
 /// A prediction market.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde_as]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Builder)]
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub struct Market {
     pub id: String,
     pub question: Option<String>,
-    pub condition_id: Option<String>,
+    #[serde_as(as = "NoneAsEmptyString")]
+    #[serde(default)]
+    pub condition_id: Option<B256>,
     pub slug: Option<String>,
     pub twitter_card_image: Option<String>,
     pub resolution_source: Option<String>,
     pub end_date: Option<DateTime<Utc>>,
     pub category: Option<String>,
     pub amm_type: Option<String>,
-    pub liquidity: Option<String>,
+    pub liquidity: Option<Decimal>,
     pub sponsor_name: Option<String>,
     pub sponsor_image: Option<String>,
     pub start_date: Option<DateTime<Utc>>,
     pub x_axis_value: Option<String>,
     pub y_axis_value: Option<String>,
-    pub denomination_token: Option<String>,
-    pub fee: Option<String>,
+    pub denomination_token: Option<U256>,
+    pub fee: Option<Decimal>,
     pub image: Option<String>,
     pub icon: Option<String>,
     pub lower_bound: Option<String>,
     pub upper_bound: Option<String>,
     pub description: Option<String>,
-    pub outcomes: Option<String>,
-    pub outcome_prices: Option<String>,
-    pub volume: Option<String>,
+    #[serde_as(as = "Option<JsonString>")]
+    pub outcomes: Option<Vec<String>>,
+    #[serde_as(as = "Option<JsonString>")]
+    pub outcome_prices: Option<Vec<Decimal>>,
+    pub volume: Option<Decimal>,
     pub active: Option<bool>,
     pub market_type: Option<String>,
     pub format_type: Option<String>,
-    pub lower_bound_date: Option<String>,
-    pub upper_bound_date: Option<String>,
+    pub lower_bound_date: Option<NaiveDate>,
+    pub upper_bound_date: Option<NaiveDate>,
     pub closed: Option<bool>,
-    pub market_maker_address: Option<String>,
+    #[serde_as(as = "NoneAsEmptyString")]
+    #[serde(default)]
+    pub market_maker_address: Option<Address>,
     pub created_by: Option<i32>,
     pub updated_by: Option<i32>,
     pub created_at: Option<DateTime<Utc>>,
@@ -380,8 +395,9 @@ pub struct Market {
     pub market_group: Option<i32>,
     pub group_item_title: Option<String>,
     pub group_item_threshold: Option<String>,
-    #[serde(rename = "questionID")]
-    pub question_id: Option<String>,
+    #[serde_as(as = "NoneAsEmptyString")]
+    #[serde(default, rename = "questionID")]
+    pub question_id: Option<B256>,
     pub uma_end_date: Option<String>,
     pub enable_order_book: Option<bool>,
     pub order_price_min_tick_size: Option<Decimal>,
@@ -390,9 +406,9 @@ pub struct Market {
     pub curation_order: Option<i32>,
     pub volume_num: Option<Decimal>,
     pub liquidity_num: Option<Decimal>,
-    pub end_date_iso: Option<String>,
-    pub start_date_iso: Option<String>,
-    pub uma_end_date_iso: Option<String>,
+    pub end_date_iso: Option<NaiveDate>,
+    pub start_date_iso: Option<NaiveDate>,
+    pub uma_end_date_iso: Option<NaiveDate>,
     pub has_reviewed_dates: Option<bool>,
     pub ready_for_cron: Option<bool>,
     pub comments_enabled: Option<bool>,
@@ -402,7 +418,8 @@ pub struct Market {
     pub volume_1yr: Option<Decimal>,
     pub game_start_time: Option<String>,
     pub seconds_delay: Option<i32>,
-    pub clob_token_ids: Option<String>,
+    #[serde_as(as = "Option<JsonString>")]
+    pub clob_token_ids: Option<Vec<U256>>,
     pub disqus_thread: Option<String>,
     pub short_outcomes: Option<String>,
     #[serde(rename = "teamAID")]
@@ -410,7 +427,7 @@ pub struct Market {
     #[serde(rename = "teamBID")]
     pub team_b_id: Option<String>,
     pub uma_bond: Option<String>,
-    pub uma_reward: Option<String>,
+    pub uma_reward: Option<Decimal>,
     pub fpmm_live: Option<bool>,
     pub volume_24hr_amm: Option<Decimal>,
     pub volume_1wk_amm: Option<Decimal>,
@@ -426,6 +443,7 @@ pub struct Market {
     pub liquidity_clob: Option<Decimal>,
     pub maker_base_fee: Option<i32>,
     pub taker_base_fee: Option<i32>,
+    pub maker_rebates_fee_share_bps: Option<i32>,
     pub custom_liveness: Option<i32>,
     pub accepting_orders: Option<bool>,
     pub notifications_enabled: Option<bool>,
@@ -483,33 +501,43 @@ pub struct Market {
     pub fees_enabled: Option<bool>,
     pub holding_rewards_enabled: Option<bool>,
     pub neg_risk: Option<bool>,
-    #[serde(rename = "negRiskRequestID")]
-    pub neg_risk_request_id: Option<String>,
-    #[serde(rename = "negRiskMarketID")]
-    pub neg_risk_market_id: Option<String>,
+    #[serde_as(as = "NoneAsEmptyString")]
+    #[serde(default, rename = "negRiskRequestID")]
+    pub neg_risk_request_id: Option<B256>,
+    #[serde_as(as = "NoneAsEmptyString")]
+    #[serde(default, rename = "negRiskMarketID")]
+    pub neg_risk_market_id: Option<B256>,
     pub sent_discord: Option<bool>,
-    pub twitter_card_last_refreshed: Option<String>,
+    #[serde_as(as = "Option<DisplayFromStr>")]
+    pub twitter_card_last_refreshed: Option<i64>,
     pub twitter_card_location: Option<String>,
     pub twitter_card_last_validated: Option<String>,
     pub clob_rewards: Option<Vec<ClobReward>>,
+    pub category_mailchimp_tag: Option<String>,
+    pub subcategory: Option<String>,
 }
 
 /// CLOB rewards configuration for a market.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde_as]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Builder)]
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub struct ClobReward {
     pub id: Option<String>,
-    pub asset_address: Option<String>,
-    pub condition_id: Option<String>,
-    pub start_date: Option<String>,
-    pub end_date: Option<String>,
+    #[serde_as(as = "NoneAsEmptyString")]
+    #[serde(default)]
+    pub asset_address: Option<Address>,
+    #[serde_as(as = "NoneAsEmptyString")]
+    #[serde(default)]
+    pub condition_id: Option<B256>,
+    pub start_date: Option<NaiveDate>,
+    pub end_date: Option<NaiveDate>,
     pub rewards_amount: Option<Decimal>,
     pub rewards_daily_rate: Option<Decimal>,
 }
 
 /// A series of related events.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Builder)]
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub struct Series {
@@ -538,7 +566,7 @@ pub struct Series {
     pub created_at: Option<DateTime<Utc>>,
     pub updated_at: Option<DateTime<Utc>>,
     pub comments_enabled: Option<bool>,
-    pub competitive: Option<String>,
+    pub competitive: Option<Decimal>,
     pub volume_24hr: Option<Decimal>,
     pub volume: Option<Decimal>,
     pub liquidity: Option<Decimal>,
@@ -557,16 +585,17 @@ pub struct Series {
 }
 
 /// A comment position.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Builder)]
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub struct CommentPosition {
-    pub token_id: Option<String>,
-    pub position_size: Option<String>,
+    pub token_id: Option<U256>,
+    pub position_size: Option<Decimal>,
 }
 
 /// A comment profile.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde_as]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Builder)]
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub struct CommentProfile {
@@ -576,15 +605,20 @@ pub struct CommentProfile {
     pub bio: Option<String>,
     pub is_mod: Option<bool>,
     pub is_creator: Option<bool>,
-    pub proxy_wallet: Option<String>,
-    pub base_address: Option<String>,
+    #[serde_as(as = "NoneAsEmptyString")]
+    #[serde(default)]
+    pub proxy_wallet: Option<Address>,
+    #[serde_as(as = "NoneAsEmptyString")]
+    #[serde(default)]
+    pub base_address: Option<Address>,
     pub profile_image: Option<String>,
     pub profile_image_optimized: Option<ImageOptimization>,
     pub positions: Option<Vec<CommentPosition>>,
 }
 
 /// A reaction to a comment.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde_as]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Builder)]
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub struct Reaction {
@@ -593,13 +627,16 @@ pub struct Reaction {
     pub comment_id: Option<i32>,
     pub reaction_type: Option<String>,
     pub icon: Option<String>,
-    pub user_address: Option<String>,
+    #[serde_as(as = "NoneAsEmptyString")]
+    #[serde(default)]
+    pub user_address: Option<Address>,
     pub created_at: Option<DateTime<Utc>>,
     pub profile: Option<CommentProfile>,
 }
 
 /// A comment on an event, series, or market.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde_as]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Builder)]
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub struct Comment {
@@ -610,8 +647,12 @@ pub struct Comment {
     pub parent_entity_id: Option<i32>,
     #[serde(rename = "parentCommentID")]
     pub parent_comment_id: Option<String>,
-    pub user_address: Option<String>,
-    pub reply_address: Option<String>,
+    #[serde_as(as = "NoneAsEmptyString")]
+    #[serde(default)]
+    pub user_address: Option<Address>,
+    #[serde_as(as = "NoneAsEmptyString")]
+    #[serde(default)]
+    pub reply_address: Option<Address>,
     pub created_at: Option<DateTime<Utc>>,
     pub updated_at: Option<DateTime<Utc>>,
     pub profile: Option<CommentProfile>,
@@ -621,7 +662,7 @@ pub struct Comment {
 }
 
 /// A user associated with a public profile.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Builder)]
 #[non_exhaustive]
 pub struct PublicProfileUser {
     pub id: Option<String>,
@@ -631,12 +672,15 @@ pub struct PublicProfileUser {
 }
 
 /// Public profile response.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde_as]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Builder)]
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub struct PublicProfile {
     pub created_at: Option<DateTime<Utc>>,
-    pub proxy_wallet: Option<String>,
+    #[serde_as(as = "NoneAsEmptyString")]
+    #[serde(default)]
+    pub proxy_wallet: Option<Address>,
     pub profile_image: Option<String>,
     pub display_username_public: Option<bool>,
     pub bio: Option<String>,
@@ -648,7 +692,7 @@ pub struct PublicProfile {
 }
 
 /// A search tag result.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Builder)]
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub struct SearchTag {
@@ -659,7 +703,8 @@ pub struct SearchTag {
 }
 
 /// A profile in search results.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde_as]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Builder)]
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub struct Profile {
@@ -681,7 +726,9 @@ pub struct Profile {
     pub display_username_public: Option<bool>,
     pub profile_image: Option<String>,
     pub bio: Option<String>,
-    pub proxy_wallet: Option<String>,
+    #[serde_as(as = "NoneAsEmptyString")]
+    #[serde(default)]
+    pub proxy_wallet: Option<Address>,
     pub profile_image_optimized: Option<ImageOptimization>,
     pub is_close_only: Option<bool>,
     pub is_cert_req: Option<bool>,
@@ -689,7 +736,7 @@ pub struct Profile {
 }
 
 /// Search results.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Builder)]
 #[non_exhaustive]
 pub struct SearchResults {
     pub events: Option<Vec<Event>>,

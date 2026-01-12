@@ -1,3 +1,4 @@
+#![cfg(feature = "gamma")]
 #![allow(
     clippy::unwrap_used,
     reason = "Do not need additional syntax for setting up tests, and https://github.com/rust-lang/rust-clippy/issues/13981"
@@ -27,7 +28,7 @@
 //! - `search`: Search across events, markets, and profiles
 //! - `health`: API health check
 
-#![cfg(feature = "gamma")]
+pub mod common;
 
 mod sports {
     use httpmock::{Method::GET, MockServer};
@@ -452,6 +453,8 @@ mod markets {
     use reqwest::StatusCode;
     use serde_json::json;
 
+    use crate::common::{token_1, token_2};
+
     #[tokio::test]
     async fn markets_should_succeed() -> anyhow::Result<()> {
         let server = MockServer::start();
@@ -556,15 +559,15 @@ mod markets {
         let mock = server.mock(|when, then| {
             when.method(GET)
                 .path("/markets")
-                .query_param("clob_token_ids", "token1")
-                .query_param("clob_token_ids", "token2");
+                .query_param("clob_token_ids", token_1().to_string())
+                .query_param("clob_token_ids", token_2().to_string());
             then.status(StatusCode::OK).json_body(json!([
                 {"id": "1", "question": "Market 1?", "slug": "market-1"}
             ]));
         });
 
         let request = MarketsRequest::builder()
-            .clob_token_ids(vec!["token1".to_owned(), "token2".to_owned()])
+            .clob_token_ids(vec![token_1(), token_2()])
             .build();
         let response = client.markets(&request).await?;
 
@@ -584,8 +587,8 @@ mod markets {
             when.method(GET)
                 .path("/markets")
                 .query_param("limit", "50")
-                .query_param("clob_token_ids", "abc")
-                .query_param("clob_token_ids", "def");
+                .query_param("clob_token_ids", token_1().to_string())
+                .query_param("clob_token_ids", token_2().to_string());
             then.status(StatusCode::OK).json_body(json!([
                 {"id": "1", "question": "Market 1?", "slug": "market-1"},
                 {"id": "2", "question": "Market 2?", "slug": "market-2"}
@@ -594,7 +597,7 @@ mod markets {
 
         let request = MarketsRequest::builder()
             .limit(50)
-            .clob_token_ids(vec!["abc".to_owned(), "def".to_owned()])
+            .clob_token_ids(vec![token_1(), token_2()])
             .build();
         let response = client.markets(&request).await?;
 
@@ -741,6 +744,7 @@ mod comments {
         Client,
         types::request::{CommentsByIdRequest, CommentsByUserAddressRequest, CommentsRequest},
     };
+    use polymarket_client_sdk::types::address;
     use reqwest::StatusCode;
     use serde_json::json;
 
@@ -838,24 +842,25 @@ mod comments {
         let client = Client::new(&server.base_url())?;
 
         let mock = server.mock(|when, then| {
+            // Address is serialized with EIP-55 checksum format
             when.method(GET)
-                .path("/comments/user_address/0x56687bf447db6ffa42ffe2204a05edaa20f55839");
+                .path("/comments/user_address/0x56687BF447DB6fFA42FFE2204a05EDAA20f55839");
             then.status(StatusCode::OK).json_body(json!([
                 {
                     "id": "1",
                     "body": "User comment",
-                    "userAddress": "0x56687bf447db6ffa42ffe2204a05edaa20f55839"
+                    "userAddress": "0x56687BF447DB6fFA42FFE2204a05EDAA20f55839"
                 },
                 {
                     "id": "2",
                     "body": "Another comment",
-                    "userAddress": "0x56687bf447db6ffa42ffe2204a05edaa20f55839"
+                    "userAddress": "0x56687BF447DB6fFA42FFE2204a05EDAA20f55839"
                 }
             ]));
         });
 
         let request = CommentsByUserAddressRequest::builder()
-            .user_address("0x56687bf447db6ffa42ffe2204a05edaa20f55839")
+            .user_address(address!("0x56687bf447db6ffa42ffe2204a05edaa20f55839"))
             .build();
         let response = client.comments_by_user_address(&request).await?;
 
@@ -871,6 +876,7 @@ mod comments {
 mod profiles {
     use httpmock::{Method::GET, MockServer};
     use polymarket_client_sdk::gamma::{Client, types::request::PublicProfileRequest};
+    use polymarket_client_sdk::types::address;
     use reqwest::StatusCode;
     use serde_json::json;
 
@@ -880,6 +886,7 @@ mod profiles {
         let client = Client::new(&server.base_url())?;
 
         let mock = server.mock(|when, then| {
+            // Address serializes to lowercase hex via serde
             when.method(GET)
                 .path("/public-profile")
                 .query_param("address", "0x56687bf447db6ffa42ffe2204a05edaa20f55839");
@@ -894,7 +901,7 @@ mod profiles {
         });
 
         let request = PublicProfileRequest::builder()
-            .address("0x56687bf447db6ffa42ffe2204a05edaa20f55839")
+            .address(address!("0x56687bf447db6ffa42ffe2204a05edaa20f55839"))
             .build();
         let response = client.public_profile(&request).await?;
 
@@ -988,6 +995,7 @@ mod market_tags {
 
 mod query_string {
     use chrono::{TimeZone as _, Utc};
+    use polymarket_client_sdk::ToQueryParams as _;
     use polymarket_client_sdk::gamma::types::request::{
         CommentsByIdRequest, CommentsByUserAddressRequest, CommentsRequest, EventByIdRequest,
         EventBySlugRequest, EventTagsRequest, EventsRequest, MarketByIdRequest,
@@ -996,17 +1004,10 @@ mod query_string {
         SeriesListRequest, TagByIdRequest, TagBySlugRequest, TagsRequest, TeamsRequest,
     };
     use polymarket_client_sdk::gamma::types::{ParentEntityType, RelatedTagsStatus};
+    use polymarket_client_sdk::types::{address, b256};
     use rust_decimal_macros::dec;
-    use serde::Serialize;
 
-    fn query_string<T: Serialize>(request: &T) -> String {
-        let params = serde_urlencoded::to_string(request).unwrap_or_default();
-        if params.is_empty() {
-            params
-        } else {
-            format!("?{params}")
-        }
-    }
+    use crate::common::{token_1, token_2};
 
     #[test]
     fn teams_request_all_params() {
@@ -1020,14 +1021,17 @@ mod query_string {
             .abbreviation(vec!["LAL".to_owned(), "BOS".to_owned()])
             .build();
 
-        let qs = query_string(&request);
+        let qs = request.query_params(None);
         assert!(qs.contains("limit=10"));
         assert!(qs.contains("offset=5"));
         assert!(qs.contains("order=name"));
         assert!(qs.contains("ascending=true"));
-        assert!(qs.contains("league=NBA%2CNFL"));
+        // Arrays should be repeated params, not comma-separated
+        assert!(qs.contains("league=NBA"));
+        assert!(qs.contains("league=NFL"));
         assert!(qs.contains("name=Lakers"));
-        assert!(qs.contains("abbreviation=LAL%2CBOS"));
+        assert!(qs.contains("abbreviation=LAL"));
+        assert!(qs.contains("abbreviation=BOS"));
     }
 
     #[test]
@@ -1038,7 +1042,7 @@ mod query_string {
             .abbreviation(vec![])
             .build();
 
-        let qs = query_string(&request);
+        let qs = request.query_params(None);
         assert!(!qs.contains("league="));
         assert!(!qs.contains("name="));
         assert!(!qs.contains("abbreviation="));
@@ -1055,7 +1059,7 @@ mod query_string {
             .is_carousel(true)
             .build();
 
-        let qs = query_string(&request);
+        let qs = request.query_params(None);
         assert!(qs.contains("limit=20"));
         assert!(qs.contains("offset=10"));
         assert!(qs.contains("order=label"));
@@ -1071,7 +1075,7 @@ mod query_string {
             .include_template(true)
             .build();
 
-        let qs = query_string(&request);
+        let qs = request.query_params(None);
         assert!(qs.contains("include_template=true"));
     }
 
@@ -1082,7 +1086,7 @@ mod query_string {
             .include_template(false)
             .build();
 
-        let qs = query_string(&request);
+        let qs = request.query_params(None);
         assert!(qs.contains("include_template=false"));
     }
 
@@ -1094,7 +1098,7 @@ mod query_string {
             .status(RelatedTagsStatus::Active)
             .build();
 
-        let qs = query_string(&request);
+        let qs = request.query_params(None);
         assert!(qs.contains("omit_empty=true"));
         assert!(qs.contains("status=active"));
     }
@@ -1107,7 +1111,7 @@ mod query_string {
             .status(RelatedTagsStatus::Closed)
             .build();
 
-        let qs = query_string(&request);
+        let qs = request.query_params(None);
         assert!(qs.contains("omit_empty=false"));
         assert!(qs.contains("status=closed"));
     }
@@ -1119,7 +1123,7 @@ mod query_string {
             .status(RelatedTagsStatus::All)
             .build();
 
-        let qs = query_string(&request);
+        let qs = request.query_params(None);
         assert!(qs.contains("status=all"));
     }
 
@@ -1157,15 +1161,20 @@ mod query_string {
             .end_date_max(end_date)
             .build();
 
-        let qs = query_string(&request);
+        let qs = request.query_params(None);
         assert!(qs.contains("limit=50"));
         assert!(qs.contains("offset=10"));
         assert!(qs.contains("order=startDate"));
         assert!(qs.contains("ascending=true"));
-        assert!(qs.contains("id=1%2C2%2C3"));
+        // Arrays should be repeated params, not comma-separated
+        assert!(qs.contains("id=1"));
+        assert!(qs.contains("id=2"));
+        assert!(qs.contains("id=3"));
         assert!(qs.contains("tag_id=42"));
-        assert!(qs.contains("exclude_tag_id=10%2C20"));
-        assert!(qs.contains("slug=event-1%2Cevent-2"));
+        assert!(qs.contains("exclude_tag_id=10"));
+        assert!(qs.contains("exclude_tag_id=20"));
+        assert!(qs.contains("slug=event-1"));
+        assert!(qs.contains("slug=event-2"));
         assert!(qs.contains("tag_slug=politics"));
         assert!(qs.contains("related_tags=true"));
         assert!(qs.contains("active=true"));
@@ -1194,7 +1203,7 @@ mod query_string {
             .slug(vec![])
             .build();
 
-        let qs = query_string(&request);
+        let qs = request.query_params(None);
         assert!(!qs.contains("id="));
         assert!(!qs.contains("exclude_tag_id="));
         assert!(!qs.contains("slug="));
@@ -1208,7 +1217,7 @@ mod query_string {
             .include_template(false)
             .build();
 
-        let qs = query_string(&request);
+        let qs = request.query_params(None);
         assert!(qs.contains("include_chat=true"));
         assert!(qs.contains("include_template=false"));
     }
@@ -1221,7 +1230,7 @@ mod query_string {
             .include_template(true)
             .build();
 
-        let qs = query_string(&request);
+        let qs = request.query_params(None);
         assert!(qs.contains("include_chat=false"));
         assert!(qs.contains("include_template=true"));
     }
@@ -1229,7 +1238,7 @@ mod query_string {
     #[test]
     fn event_tags_request_empty_params() {
         let request = EventTagsRequest::builder().id("123").build();
-        let qs = query_string(&request);
+        let qs = request.query_params(None);
         assert!(qs.is_empty());
     }
 
@@ -1245,9 +1254,11 @@ mod query_string {
             .ascending(false)
             .id(vec!["1".to_owned(), "2".to_owned()])
             .slug(vec!["market-1".to_owned()])
-            .clob_token_ids(vec!["token1".to_owned(), "token2".to_owned()])
-            .condition_ids(vec!["cond1".to_owned()])
-            .market_maker_address(vec!["0x123".to_owned()])
+            .clob_token_ids(vec![token_1(), token_2()])
+            .condition_ids(vec![b256!(
+                "0x0000000000000000000000000000000000000000000000000000000000000001"
+            )])
+            .market_maker_address(vec![address!("0x0000000000000000000000000000000000000123")])
             .liquidity_num_min(dec!(1000))
             .liquidity_num_max(dec!(100_000))
             .volume_num_min(dec!(500))
@@ -1263,26 +1274,31 @@ mod query_string {
             .game_id("game123".to_owned())
             .sports_market_types(vec!["moneyline".to_owned(), "spread".to_owned()])
             .rewards_min_size(dec!(100))
-            .question_ids(vec!["q1".to_owned(), "q2".to_owned()])
+            .question_ids(vec![
+                b256!("0x0000000000000000000000000000000000000000000000000000000000000001"),
+                b256!("0x0000000000000000000000000000000000000000000000000000000000000002"),
+            ])
             .include_tag(true)
             .closed(false)
             .build();
 
-        let qs = query_string(&request);
+        let qs = request.query_params(None);
         assert!(qs.contains("limit=100"));
         assert!(qs.contains("offset=50"));
         assert!(qs.contains("order=volume"));
         assert!(qs.contains("ascending=false"));
-        assert!(qs.contains("id=1%2C2"));
+        // Arrays should be repeated params, not comma-separated
+        assert!(qs.contains("id=1"));
+        assert!(qs.contains("id=2"));
         assert!(qs.contains("slug=market-1"));
-        // clob_token_ids is handled separately via clob_token_ids_query() for repeated params
-        assert!(!qs.contains("clob_token_ids"));
-        let clob_qs = request.clob_token_ids_query();
-        assert!(clob_qs.contains("clob_token_ids=token1"));
-        assert!(clob_qs.contains("clob_token_ids=token2"));
-        assert!(clob_qs.contains('&')); // Repeated params format
-        assert!(qs.contains("condition_ids=cond1"));
-        assert!(qs.contains("market_maker_address=0x123"));
+        // clob_token_ids is now handled with repeated params like all other arrays
+        assert!(qs.contains(&format!("clob_token_ids={}", token_1())));
+        assert!(qs.contains(&format!("clob_token_ids={}", token_2())));
+        // B256 and Address serialize to lowercase hex via serde (repeated params)
+        assert!(qs.contains(
+            "condition_ids=0x0000000000000000000000000000000000000000000000000000000000000001"
+        ));
+        assert!(qs.contains("market_maker_address=0x0000000000000000000000000000000000000123"));
         assert!(qs.contains("liquidity_num_min=1000"));
         assert!(qs.contains("liquidity_num_max=100000"));
         assert!(qs.contains("volume_num_min=500"));
@@ -1296,9 +1312,16 @@ mod query_string {
         assert!(qs.contains("cyom=false"));
         assert!(qs.contains("uma_resolution_status=resolved"));
         assert!(qs.contains("game_id=game123"));
-        assert!(qs.contains("sports_market_types=moneyline%2Cspread"));
+        assert!(qs.contains("sports_market_types=moneyline"));
+        assert!(qs.contains("sports_market_types=spread"));
         assert!(qs.contains("rewards_min_size=100"));
-        assert!(qs.contains("question_ids=q1%2Cq2"));
+        // B256 question_ids serialize to lowercase hex via serde (repeated params)
+        assert!(qs.contains(
+            "question_ids=0x0000000000000000000000000000000000000000000000000000000000000001"
+        ));
+        assert!(qs.contains(
+            "question_ids=0x0000000000000000000000000000000000000000000000000000000000000002"
+        ));
         assert!(qs.contains("include_tag=true"));
         assert!(qs.contains("closed=false"));
     }
@@ -1315,7 +1338,7 @@ mod query_string {
             .question_ids(vec![])
             .build();
 
-        let qs = query_string(&request);
+        let qs = request.query_params(None);
         assert!(!qs.contains("id="));
         assert!(!qs.contains("slug="));
         assert!(!qs.contains("clob_token_ids="));
@@ -1332,7 +1355,7 @@ mod query_string {
             .include_tag(true)
             .build();
 
-        let qs = query_string(&request);
+        let qs = request.query_params(None);
         assert!(qs.contains("include_tag=true"));
     }
 
@@ -1343,14 +1366,14 @@ mod query_string {
             .include_tag(false)
             .build();
 
-        let qs = query_string(&request);
+        let qs = request.query_params(None);
         assert!(qs.contains("include_tag=false"));
     }
 
     #[test]
     fn market_tags_request_empty_params() {
         let request = MarketTagsRequest::builder().id("456").build();
-        let qs = query_string(&request);
+        let qs = request.query_params(None);
         assert!(qs.is_empty());
     }
 
@@ -1369,14 +1392,19 @@ mod query_string {
             .recurrence("daily".to_owned())
             .build();
 
-        let qs = query_string(&request);
+        let qs = request.query_params(None);
         assert!(qs.contains("limit=25"));
         assert!(qs.contains("offset=5"));
         assert!(qs.contains("order=title"));
         assert!(qs.contains("ascending=true"));
-        assert!(qs.contains("slug=series-1%2Cseries-2"));
-        assert!(qs.contains("categories_ids=1%2C2%2C3"));
-        assert!(qs.contains("categories_labels=Sports%2CPolitics"));
+        // Arrays should be repeated params, not comma-separated
+        assert!(qs.contains("slug=series-1"));
+        assert!(qs.contains("slug=series-2"));
+        assert!(qs.contains("categories_ids=1"));
+        assert!(qs.contains("categories_ids=2"));
+        assert!(qs.contains("categories_ids=3"));
+        assert!(qs.contains("categories_labels=Sports"));
+        assert!(qs.contains("categories_labels=Politics"));
         assert!(qs.contains("closed=false"));
         assert!(qs.contains("include_chat=true"));
         assert!(qs.contains("recurrence=daily"));
@@ -1390,7 +1418,7 @@ mod query_string {
             .categories_labels(vec![])
             .build();
 
-        let qs = query_string(&request);
+        let qs = request.query_params(None);
         assert!(!qs.contains("slug="));
         assert!(!qs.contains("categories_ids="));
         assert!(!qs.contains("categories_labels="));
@@ -1403,7 +1431,7 @@ mod query_string {
             .include_chat(true)
             .build();
 
-        let qs = query_string(&request);
+        let qs = request.query_params(None);
         assert!(qs.contains("include_chat=true"));
     }
 
@@ -1420,7 +1448,7 @@ mod query_string {
             .holders_only(true)
             .build();
 
-        let qs = query_string(&request);
+        let qs = request.query_params(None);
         assert!(qs.contains("limit=50"));
         assert!(qs.contains("offset=10"));
         assert!(qs.contains("order=createdAt"));
@@ -1438,7 +1466,7 @@ mod query_string {
             .parent_entity_id("series-123")
             .build();
 
-        let qs = query_string(&request);
+        let qs = request.query_params(None);
         assert!(qs.contains("parent_entity_type=Series"));
         assert!(qs.contains("parent_entity_id=series-123"));
     }
@@ -1450,7 +1478,7 @@ mod query_string {
             .parent_entity_id("market-456")
             .build();
 
-        let qs = query_string(&request);
+        let qs = request.query_params(None);
         assert!(qs.contains("parent_entity_type=market"));
         assert!(qs.contains("parent_entity_id=market-456"));
     }
@@ -1462,21 +1490,21 @@ mod query_string {
             .get_positions(true)
             .build();
 
-        let qs = query_string(&request);
+        let qs = request.query_params(None);
         assert!(qs.contains("get_positions=true"));
     }
 
     #[test]
     fn comments_by_user_address_request_all_params() {
         let request = CommentsByUserAddressRequest::builder()
-            .user_address("0x56687bf447db6ffa42ffe2204a05edaa20f55839")
+            .user_address(address!("0x56687bf447db6ffa42ffe2204a05edaa20f55839"))
             .limit(20)
             .offset(5)
             .order("createdAt".to_owned())
             .ascending(true)
             .build();
 
-        let qs = query_string(&request);
+        let qs = request.query_params(None);
         assert!(qs.contains("limit=20"));
         assert!(qs.contains("offset=5"));
         assert!(qs.contains("order=createdAt"));
@@ -1486,10 +1514,11 @@ mod query_string {
     #[test]
     fn public_profile_request_params() {
         let request = PublicProfileRequest::builder()
-            .address("0x56687bf447db6ffa42ffe2204a05edaa20f55839")
+            .address(address!("0x56687bf447db6ffa42ffe2204a05edaa20f55839"))
             .build();
 
-        let qs = query_string(&request);
+        let qs = request.query_params(None);
+        // Address serializes to lowercase hex via serde
         assert!(qs.contains("address=0x56687bf447db6ffa42ffe2204a05edaa20f55839"));
     }
 
@@ -1512,20 +1541,23 @@ mod query_string {
             .optimized(true)
             .build();
 
-        let qs = query_string(&request);
+        let qs = request.query_params(None);
         assert!(qs.contains("q=bitcoin"));
         assert!(qs.contains("cache=true"));
         assert!(qs.contains("events_status=active"));
         assert!(qs.contains("limit_per_type=10"));
         assert!(qs.contains("page=2"));
-        assert!(qs.contains("events_tag=crypto%2Cfinance"));
+        // Arrays should be repeated params, not comma-separated
+        assert!(qs.contains("events_tag=crypto"));
+        assert!(qs.contains("events_tag=finance"));
         assert!(qs.contains("keep_closed_markets=5"));
         assert!(qs.contains("sort=volume"));
         assert!(qs.contains("ascending=false"));
         assert!(qs.contains("search_tags=true"));
         assert!(qs.contains("search_profiles=true"));
         assert!(qs.contains("recurrence=weekly"));
-        assert!(qs.contains("exclude_tag_id=1%2C2"));
+        assert!(qs.contains("exclude_tag_id=1"));
+        assert!(qs.contains("exclude_tag_id=2"));
         assert!(qs.contains("optimized=true"));
     }
 
@@ -1537,14 +1569,14 @@ mod query_string {
             .exclude_tag_id(vec![])
             .build();
 
-        let qs = query_string(&request);
+        let qs = request.query_params(None);
         assert!(!qs.contains("events_tag="));
         assert!(!qs.contains("exclude_tag_id="));
     }
 
     #[test]
     fn unit_query_string_returns_empty() {
-        let qs = query_string(&());
+        let qs = ().query_params(None);
         assert!(qs.is_empty());
     }
 }

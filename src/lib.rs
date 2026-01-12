@@ -3,7 +3,10 @@
 pub mod auth;
 #[cfg(feature = "bridge")]
 pub mod bridge;
+#[cfg(feature = "clob")]
 pub mod clob;
+#[cfg(feature = "ctf")]
+pub mod ctf;
 #[cfg(feature = "data")]
 pub mod data;
 pub mod error;
@@ -21,9 +24,20 @@ use std::fmt::Write as _;
 use alloy::primitives::ChainId;
 use alloy::primitives::{B256, b256, keccak256};
 use phf::phf_map;
-use reqwest::header::HeaderMap;
-use reqwest::{Request, StatusCode};
+#[cfg(any(
+    feature = "bridge",
+    feature = "clob",
+    feature = "data",
+    feature = "gamma"
+))]
+use reqwest::{Request, StatusCode, header::HeaderMap};
 use serde::Serialize;
+#[cfg(any(
+    feature = "bridge",
+    feature = "clob",
+    feature = "data",
+    feature = "gamma"
+))]
 use serde::de::DeserializeOwned;
 
 use crate::error::Error;
@@ -185,7 +199,8 @@ pub fn derive_safe_wallet(eoa_address: Address, chain_id: ChainId) -> Option<Add
 /// Trait for converting request types to URL query parameters.
 ///
 /// This trait is automatically implemented for all types that implement [`Serialize`].
-/// It uses [`serde_urlencoded`] to serialize the struct fields into a query string.
+/// It uses [`serde_html_form`] to serialize the struct fields into a query string.
+/// Arrays are serialized as repeated keys (`key=val1&key=val2`).
 pub trait ToQueryParams: Serialize {
     /// Converts the request to a URL query string.
     ///
@@ -193,13 +208,12 @@ pub trait ToQueryParams: Serialize {
     /// a string starting with `?` followed by URL-encoded key-value pairs.
     /// Also uses an optional cursor as a parameter, if provided.
     fn query_params(&self, next_cursor: Option<&str>) -> String {
-        let mut params = serde_urlencoded::to_string(self)
+        let mut params = serde_html_form::to_string(self)
             .inspect_err(|e| {
-                #[cfg(not(feature = "tracing"))]
-                let _: &serde_urlencoded::ser::Error = e;
-
                 #[cfg(feature = "tracing")]
                 tracing::error!("Unable to convert to URL-encoded string {e:?}");
+                #[cfg(not(feature = "tracing"))]
+                let _: &serde_html_form::ser::Error = e;
             })
             .unwrap_or_default();
 
@@ -220,6 +234,12 @@ pub trait ToQueryParams: Serialize {
 
 impl<T: Serialize> ToQueryParams for T {}
 
+#[cfg(any(
+    feature = "bridge",
+    feature = "clob",
+    feature = "data",
+    feature = "gamma"
+))]
 #[cfg_attr(
     feature = "tracing",
     tracing::instrument(

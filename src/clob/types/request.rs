@@ -5,56 +5,68 @@
 
 use bon::Builder;
 use chrono::NaiveDate;
-use serde::Serialize;
-use serde_with::{StringWithSeparator, formats::CommaSeparator, serde_as, skip_serializing_none};
-
+use serde::{Serialize, Serializer};
+use serde_with::{
+    DisplayFromStr, StringWithSeparator, formats::CommaSeparator, serde_as, skip_serializing_none,
+};
 #[cfg(feature = "rfq")]
-use crate::auth::ApiKey;
+use {
+    crate::clob::types::{RfqSortBy, RfqSortDir, RfqState},
+    crate::{Timestamp, auth::ApiKey, types::Decimal},
+};
+
 use crate::clob::types::{AssetType, Side, SignatureType, TimeRange};
-#[cfg(feature = "rfq")]
-use crate::clob::types::{RfqSortBy, RfqSortDir, RfqState};
-use crate::types::Address;
-#[cfg(feature = "rfq")]
-use crate::types::Decimal;
+use crate::types::U256;
+use crate::types::{Address, B256};
 
+#[serde_as]
 #[non_exhaustive]
 #[derive(Debug, Serialize, Builder)]
 #[builder(on(String, into))]
 pub struct MidpointRequest {
-    pub token_id: String,
+    #[serde_as(as = "DisplayFromStr")]
+    pub token_id: U256,
 }
 
+#[serde_as]
 #[non_exhaustive]
 #[derive(Debug, Serialize, Builder)]
 #[builder(on(String, into))]
 pub struct PriceRequest {
-    pub token_id: String,
+    #[serde_as(as = "DisplayFromStr")]
+    pub token_id: U256,
     pub side: Side,
 }
 
 #[non_exhaustive]
+#[serde_as]
 #[skip_serializing_none]
 #[derive(Debug, Serialize, Builder)]
 #[builder(on(String, into))]
 pub struct SpreadRequest {
-    pub token_id: String,
+    #[serde_as(as = "DisplayFromStr")]
+    pub token_id: U256,
     pub side: Option<Side>,
 }
 
 #[non_exhaustive]
+#[serde_as]
 #[skip_serializing_none]
 #[derive(Debug, Serialize, Builder)]
 #[builder(on(String, into))]
 pub struct OrderBookSummaryRequest {
-    pub token_id: String,
+    #[serde_as(as = "DisplayFromStr")]
+    pub token_id: U256,
     pub side: Option<Side>,
 }
 
 #[non_exhaustive]
+#[serde_as]
 #[derive(Debug, Serialize, Builder)]
 #[builder(on(String, into))]
 pub struct LastTradePriceRequest {
-    pub token_id: String,
+    #[serde_as(as = "DisplayFromStr")]
+    pub token_id: U256,
 }
 
 #[non_exhaustive]
@@ -62,26 +74,31 @@ pub struct LastTradePriceRequest {
 #[derive(Debug, Serialize, Builder)]
 #[builder(on(String, into))]
 pub struct PriceHistoryRequest {
-    /// The market (condition ID) to get price history for.
-    pub market: String,
+    /// The market condition ID.
+    pub market: B256,
     /// The time range for the price history query.
     /// Either a predefined interval or explicit start/end timestamps.
     #[serde(flatten)]
     #[builder(into)]
     pub time_range: TimeRange,
     /// Optional fidelity (number of data points).
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub fidelity: Option<u32>,
 }
 
 #[non_exhaustive]
+#[serde_as]
 #[derive(Debug, Default, Serialize, Builder)]
 #[builder(on(String, into))]
 pub struct CancelMarketOrderRequest {
-    pub market: Option<String>,
-    pub asset_id: Option<String>,
+    /// The market condition ID to cancel orders for.
+    pub market: Option<B256>,
+    #[serde_as(as = "Option<DisplayFromStr>")]
+    pub asset_id: Option<U256>,
 }
 
 #[non_exhaustive]
+#[serde_as]
 #[derive(Debug, Default, Clone, Builder, Serialize)]
 #[builder(on(String, into))]
 pub struct TradesRequest {
@@ -90,20 +107,25 @@ pub struct TradesRequest {
     pub taker_address: Option<Address>,
     #[serde(rename = "maker")]
     pub maker_address: Option<Address>,
-    pub market: Option<String>,
-    pub asset_id: Option<String>,
+    /// The market condition ID to filter trades.
+    pub market: Option<B256>,
+    #[serde_as(as = "Option<DisplayFromStr>")]
+    pub asset_id: Option<U256>,
     pub before: Option<i64>,
     pub after: Option<i64>,
 }
 
 #[non_exhaustive]
+#[serde_as]
 #[derive(Debug, Default, Serialize, Builder)]
 #[builder(on(String, into))]
 pub struct OrdersRequest {
     #[serde(rename = "id")]
     pub order_id: Option<String>,
-    pub market: Option<String>,
-    pub asset_id: Option<String>,
+    /// The market condition ID to filter orders.
+    pub market: Option<B256>,
+    #[serde_as(as = "Option<DisplayFromStr>")]
+    pub asset_id: Option<U256>,
 }
 
 #[non_exhaustive]
@@ -117,11 +139,13 @@ pub struct DeleteNotificationsRequest {
 }
 
 #[non_exhaustive]
+#[serde_as]
 #[derive(Debug, Default, Clone, Builder, Serialize)]
 #[builder(on(String, into))]
 pub struct BalanceAllowanceRequest {
     pub asset_type: AssetType,
-    pub token_id: Option<String>,
+    #[serde_as(as = "Option<DisplayFromStr>")]
+    pub token_id: Option<U256>,
     pub signature_type: Option<SignatureType>,
 }
 
@@ -140,6 +164,25 @@ pub struct UserRewardsEarningRequest {
     pub no_competition: bool,
 }
 
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq)]
+pub enum Asset {
+    Usdc,
+    Asset(U256),
+}
+
+impl Serialize for Asset {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Asset::Usdc => serializer.serialize_str("0"),
+            Asset::Asset(a) => serializer.collect_str(a),
+        }
+    }
+}
+
 /// Request body for creating an RFQ request.
 ///
 /// Creates an RFQ Request to buy or sell outcome tokens.
@@ -147,12 +190,11 @@ pub struct UserRewardsEarningRequest {
 #[non_exhaustive]
 #[derive(Debug, Clone, Serialize, Builder)]
 #[serde(rename_all = "camelCase")]
-#[builder(on(String, into))]
 pub struct CreateRfqRequestRequest {
     /// Token ID the Requester wants to receive. "0" indicates USDC.
-    pub asset_in: String,
+    pub asset_in: Asset,
     /// Token ID the Requester wants to give. "0" indicates USDC.
-    pub asset_out: String,
+    pub asset_out: Asset,
     /// Amount of asset to receive (in base units).
     pub amount_in: Decimal,
     /// Amount of asset to give (in base units).
@@ -175,6 +217,7 @@ pub struct CancelRfqRequestRequest {
 /// Query parameters for getting RFQ requests.
 #[cfg(feature = "rfq")]
 #[non_exhaustive]
+#[serde_as]
 #[skip_serializing_none]
 #[derive(Debug, Clone, Default, Serialize, Builder)]
 #[serde(rename_all = "camelCase")]
@@ -190,10 +233,11 @@ pub struct RfqRequestsRequest {
     #[serde(rename = "requestIds", skip_serializing_if = "Vec::is_empty")]
     #[builder(default)]
     pub request_ids: Vec<String>,
-    /// Filter by condition IDs.
+    /// Filter by market condition IDs.
+    #[serde_as(as = "StringWithSeparator::<CommaSeparator, B256>")]
     #[serde(skip_serializing_if = "Vec::is_empty")]
     #[builder(default)]
-    pub markets: Vec<String>,
+    pub markets: Vec<B256>,
     /// Minimum size in tokens.
     pub size_min: Option<Decimal>,
     /// Maximum size in tokens.
@@ -222,9 +266,9 @@ pub struct CreateRfqQuoteRequest {
     /// ID of the Request to quote.
     pub request_id: String,
     /// Token ID the Quoter wants to receive. "0" indicates USDC.
-    pub asset_in: String,
+    pub asset_in: Asset,
     /// Token ID the Quoter wants to give. "0" indicates USDC.
-    pub asset_out: String,
+    pub asset_out: Asset,
     /// Amount of asset to receive (in base units).
     pub amount_in: Decimal,
     /// Amount of asset to give (in base units).
@@ -247,6 +291,7 @@ pub struct CancelRfqQuoteRequest {
 /// Query parameters for getting RFQ quotes.
 #[cfg(feature = "rfq")]
 #[non_exhaustive]
+#[serde_as]
 #[skip_serializing_none]
 #[derive(Debug, Clone, Default, Serialize, Builder)]
 #[serde(rename_all = "camelCase")]
@@ -266,10 +311,11 @@ pub struct RfqQuotesRequest {
     #[serde(rename = "requestIds", skip_serializing_if = "Vec::is_empty")]
     #[builder(default)]
     pub request_ids: Vec<String>,
-    /// Filter by condition IDs.
+    /// Filter by market condition IDs.
+    #[serde_as(as = "StringWithSeparator::<CommaSeparator, B256>")]
     #[serde(skip_serializing_if = "Vec::is_empty")]
     #[builder(default)]
-    pub markets: Vec<String>,
+    pub markets: Vec<B256>,
     /// Minimum size in tokens.
     pub size_min: Option<Decimal>,
     /// Maximum size in tokens.
@@ -293,6 +339,7 @@ pub struct RfqQuotesRequest {
 /// This creates an Order that the Requester must sign.
 #[cfg(feature = "rfq")]
 #[non_exhaustive]
+#[serde_as]
 #[derive(Debug, Clone, Serialize, Builder)]
 #[serde(rename_all = "camelCase")]
 #[builder(on(String, into))]
@@ -306,7 +353,8 @@ pub struct AcceptRfqQuoteRequest {
     /// Taker's amount in base units.
     pub taker_amount: Decimal,
     /// Outcome token ID.
-    pub token_id: String,
+    #[serde_as(as = "DisplayFromStr")]
+    pub token_id: U256,
     /// Maker's address.
     pub maker: Address,
     /// Signer's address.
@@ -314,13 +362,13 @@ pub struct AcceptRfqQuoteRequest {
     /// Taker's address.
     pub taker: Address,
     /// Order nonce.
-    pub nonce: String,
+    pub nonce: u64,
     /// Unix timestamp for order expiration.
     pub expiration: i64,
     /// Order side (BUY or SELL).
     pub side: Side,
     /// Fee rate in basis points.
-    pub fee_rate_bps: String,
+    pub fee_rate_bps: u64,
     /// EIP-712 signature.
     pub signature: String,
     /// Random salt for order uniqueness.
@@ -334,6 +382,7 @@ pub struct AcceptRfqQuoteRequest {
 /// Quoter approves an RFQ order during the last look window.
 #[cfg(feature = "rfq")]
 #[non_exhaustive]
+#[serde_as]
 #[derive(Debug, Clone, Serialize, Builder)]
 #[serde(rename_all = "camelCase")]
 #[builder(on(String, into))]
@@ -347,7 +396,8 @@ pub struct ApproveRfqOrderRequest {
     /// Taker's amount in base units.
     pub taker_amount: Decimal,
     /// Outcome token ID.
-    pub token_id: String,
+    #[serde_as(as = "DisplayFromStr")]
+    pub token_id: U256,
     /// Maker's address.
     pub maker: Address,
     /// Signer's address.
@@ -355,13 +405,13 @@ pub struct ApproveRfqOrderRequest {
     /// Taker's address.
     pub taker: Address,
     /// Order nonce.
-    pub nonce: String,
+    pub nonce: u64,
     /// Unix timestamp for order expiration.
-    pub expiration: i64,
+    pub expiration: Timestamp,
     /// Order side (BUY or SELL).
     pub side: Side,
     /// Fee rate in basis points.
-    pub fee_rate_bps: String,
+    pub fee_rate_bps: u64,
     /// EIP-712 signature.
     pub signature: String,
     /// Random salt for order uniqueness.
@@ -374,41 +424,44 @@ pub struct ApproveRfqOrderRequest {
 mod tests {
     use super::*;
     use crate::ToQueryParams as _;
+    use crate::types::b256;
 
     #[test]
     fn trades_request_as_params_should_succeed() {
+        let market = b256!("0000000000000000000000000000000000000000000000000000000000010000");
         let request = TradesRequest::builder()
-            .market("10000")
-            .asset_id("100")
+            .market(market)
+            .asset_id(U256::from(100))
             .id("aa-bb")
             .maker_address(Address::ZERO)
             .build();
 
         assert_eq!(
             request.query_params(None),
-            "?id=aa-bb&maker=0x0000000000000000000000000000000000000000&market=10000&asset_id=100"
+            "?id=aa-bb&maker=0x0000000000000000000000000000000000000000&market=0x0000000000000000000000000000000000000000000000000000000000010000&asset_id=100"
         );
         assert_eq!(
             request.query_params(Some("1")),
-            "?id=aa-bb&maker=0x0000000000000000000000000000000000000000&market=10000&asset_id=100&next_cursor=1"
+            "?id=aa-bb&maker=0x0000000000000000000000000000000000000000&market=0x0000000000000000000000000000000000000000000000000000000000010000&asset_id=100&next_cursor=1"
         );
     }
 
     #[test]
     fn orders_request_as_params_should_succeed() {
+        let market = b256!("0000000000000000000000000000000000000000000000000000000000010000");
         let request = OrdersRequest::builder()
-            .market("10000")
-            .asset_id("100")
+            .market(market)
+            .asset_id(U256::from(100))
             .order_id("aa-bb")
             .build();
 
         assert_eq!(
             request.query_params(None),
-            "?id=aa-bb&market=10000&asset_id=100"
+            "?id=aa-bb&market=0x0000000000000000000000000000000000000000000000000000000000010000&asset_id=100"
         );
         assert_eq!(
             request.query_params(Some("1")),
-            "?id=aa-bb&market=10000&asset_id=100&next_cursor=1"
+            "?id=aa-bb&market=0x0000000000000000000000000000000000000000000000000000000000010000&asset_id=100&next_cursor=1"
         );
     }
 
@@ -427,7 +480,7 @@ mod tests {
     fn balance_allowance_request_as_params_should_succeed() {
         let request = BalanceAllowanceRequest::builder()
             .asset_type(AssetType::Collateral)
-            .token_id("1".to_owned())
+            .token_id(U256::from(1))
             .signature_type(SignatureType::Eoa)
             .build();
 
