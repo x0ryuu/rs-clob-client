@@ -1528,6 +1528,7 @@ impl<K: Kind> Client<Authenticated<K>> {
         next_cursor: Option<String>,
     ) -> Result<Page<OpenOrderResponse>> {
         let params = request.query_params(next_cursor.as_deref());
+        println!("params: {}", params);
         let request = self
             .client()
             .request(Method::GET, format!("{}data/orders{params}", self.host()))
